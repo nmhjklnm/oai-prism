@@ -1,0 +1,197 @@
+package facade
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// codexToolsRaw 构造一份带 MCP 工具的 Codex 请求（顶层 tools 路径）。
+func codexToolsRaw() map[string]json.RawMessage {
+	tools := `[` +
+		`{"type":"function","name":"exec_command","description":"Runs a command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}},` +
+		`{"type":"function","name":"mcp__ctx7__query_docs","description":"Query docs for a library.\n\nLong extra text.","parameters":{"type":"object","properties":{"libraryId":{"type":"string"},"query":{"type":"string"}},"required":["libraryId","query"]}},` +
+		`{"type":"custom","name":"apply_patch","description":"Apply a patch"}` +
+		`]`
+	input := `[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]`
+	return map[string]json.RawMessage{
+		"tools": json.RawMessage(tools),
+		"input": json.RawMessage(input),
+	}
+}
+
+func TestRegisteredClientToolsTopLevel(t *testing.T) {
+	tools := registeredClientTools(codexToolsRaw())
+	if len(tools) != 1 {
+		t.Fatalf("应只登记 1 个非内建工具（mcp__ctx7__query_docs），得到 %d: %+v", len(tools), tools)
+	}
+	c := tools[0]
+	if c.Name != "mcp__ctx7__query_docs" || c.Kind != "function" {
+		t.Fatalf("工具识别错误: %+v", c)
+	}
+	if c.Args == "" || !strings.Contains(c.Args, "libraryId (required)") {
+		t.Errorf("参数摘要应含 required 标记: %q", c.Args)
+	}
+	if !strings.Contains(c.Schema, `"libraryId"`) {
+		t.Errorf("Schema 应保留原始 JSON: %q", c.Schema)
+	}
+}
+
+// lite 路径：工具在 input 的 additional_tools 里，按 namespace 分组。
+func TestRegisteredClientToolsNamespaced(t *testing.T) {
+	input := `[
+ {"type":"additional_tools","role":"developer","tools":[
+  {"type":"namespace","name":"mcp__node_repl","tools":[
+   {"type":"function","name":"js","description":"Run JS","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}
+  ]},
+  {"type":"function","name":"exec_command","parameters":{"type":"object"}}
+ ]}
+]`
+	var v any
+	if err := json.Unmarshal([]byte(input), &v); err != nil {
+		t.Fatalf("测试输入不是合法 JSON: %v", err)
+	}
+	tools := registeredClientTools(map[string]json.RawMessage{"input": json.RawMessage(input)})
+	if len(tools) != 1 || tools[0].Name != "mcp__node_repl__js" {
+		t.Fatalf("namespace 组内工具应展开为全名: %+v", tools)
+	}
+}
+
+func TestToolDocsSectionBudget(t *testing.T) {
+	tools := registeredClientTools(codexToolsRaw())
+	docs := toolDocsSection(tools)
+	if !strings.Contains(docs, "mcp__ctx7__query_docs (function)") || !strings.Contains(docs, "JSON Schema:") {
+		t.Errorf("目录应含完整条目: %s", docs)
+	}
+	if toolDocsSection(nil) != "" {
+		t.Error("无工具时应返回空串")
+	}
+}
+
+func TestParseBridgeCallsMCPPassthrough(t *testing.T) {
+	tools := registeredClientTools(codexToolsRaw())
+	js := "const r = await tools.mcp__ctx7__query_docs({ \"libraryId\": \"/openai/codex\", \"query\": \"shell tool\" });\ntext(r);"
+	calls := parseBridgeCalls(js, tools, "exec_command", "function")
+	if len(calls) != 1 {
+		t.Fatalf("应解析出 1 个调用: %+v", calls)
+	}
+	if calls[0].Name != "mcp__ctx7__query_docs" || calls[0].Kind != "function" {
+		t.Fatalf("调用识别错误: %+v", calls[0])
+	}
+	var args map[string]any
+	if json.Unmarshal([]byte(calls[0].ArgsJSON), &args) != nil || args["libraryId"] != "/openai/codex" {
+		t.Fatalf("参数应原样保留: %s", calls[0].ArgsJSON)
+	}
+}
+
+// 纯 exec 块必须返回 nil（走带全部兜底加固的老路径）。
+func TestParseBridgeCallsExecOnlyFallsBack(t *testing.T) {
+	tools := registeredClientTools(codexToolsRaw())
+	js := "const out = await tools.exec_command({ cmd: \"ls -la\" });\ntext(out);"
+	if calls := parseBridgeCalls(js, tools, "exec_command", "function"); calls != nil {
+		t.Fatalf("纯 exec 块应走老路径，得到 %+v", calls)
+	}
+}
+
+// 混合块：exec 与 MCP 调用各成一条；未知工具名不透传。
+func TestParseBridgeCallsMixed(t *testing.T) {
+	tools := registeredClientTools(codexToolsRaw())
+	js := "const a = await tools.exec_command({ cmd: \"pwd\" });\n" +
+		"const r = await tools.mcp__ctx7__query_docs({ \"libraryId\": \"x\", \"query\": \"y\" });\n" +
+		"const z = await tools.no_such_tool({ a: 1 });\ntext(r);"
+	calls := parseBridgeCalls(js, tools, "exec_command", "function")
+	if len(calls) != 2 {
+		t.Fatalf("应解析出 2 个调用（未知工具丢弃）: %+v", calls)
+	}
+	if !calls[0].IsExec || calls[0].Name != "exec_command" {
+		t.Fatalf("第一条应是 exec: %+v", calls[0])
+	}
+	if calls[1].Name != "mcp__ctx7__query_docs" {
+		t.Fatalf("第二条应是 MCP: %+v", calls[1])
+	}
+	if !json.Valid([]byte(calls[0].ArgsJSON)) || !strings.Contains(calls[0].ArgsJSON, "pwd") {
+		t.Fatalf("exec 参数应合法: %s", calls[0].ArgsJSON)
+	}
+}
+
+// 模型写了 JS 形态（键不带引号）的 MCP 调用也应能解析。
+func TestParseBridgeCallsLenientArgs(t *testing.T) {
+	tools := registeredClientTools(codexToolsRaw())
+	js := "const r = await tools.mcp__ctx7__query_docs({ libraryId: 'x', query: \"y\" });\ntext(r);"
+	calls := parseBridgeCalls(js, tools, "exec_command", "function")
+	if len(calls) != 1 {
+		t.Fatalf("宽松解析失败: %+v", calls)
+	}
+	var args map[string]any
+	if json.Unmarshal([]byte(calls[0].ArgsJSON), &args) != nil || args["libraryId"] != "x" {
+		t.Fatalf("宽松参数应转成合法 JSON: %s", calls[0].ArgsJSON)
+	}
+}
+
+// 放行申请透传：桥面别名 needs_approval 必须翻译成客户端认的
+// sandbox_permissions + justification，否则弹不出批准框；直接写
+// sandbox_permissions 的（JSON 路径）也照常透传。
+func TestToFunctionArgumentsEscalation(t *testing.T) {
+	js := "const out = await tools.exec_command({ cmd: \"npm install\", needs_approval: \"Install dependencies with npm?\" });"
+	args := toFunctionArguments(js)
+	var m map[string]any
+	if json.Unmarshal([]byte(args), &m) != nil {
+		t.Fatalf("不是合法 JSON: %s", args)
+	}
+	if m["cmd"] != "npm install" {
+		t.Errorf("cmd 提取错误: %v", m["cmd"])
+	}
+	if m["sandbox_permissions"] != "require_escalated" {
+		t.Errorf("needs_approval 未翻译成 require_escalated: %v", m["sandbox_permissions"])
+	}
+	if m["justification"] != "Install dependencies with npm?" {
+		t.Errorf("justification 未翻译: %v", m["justification"])
+	}
+
+	// 对象形态：{ justification, prefix_rule }
+	js2 := `const o = await tools.exec_command({ cmd: "git pull", needs_approval: { justification: "Pull latest changes?", prefix_rule: ["git", "pull"] } });`
+	var m2 map[string]any
+	if json.Unmarshal([]byte(toFunctionArguments(js2)), &m2) != nil {
+		t.Fatalf("对象形态解析失败")
+	}
+	if m2["sandbox_permissions"] != "require_escalated" || m2["justification"] != "Pull latest changes?" {
+		t.Errorf("对象形态翻译错误: %v", m2)
+	}
+	pr, ok := m2["prefix_rule"].([]any)
+	if !ok || len(pr) != 2 || pr[0] != "git" {
+		t.Errorf("prefix_rule 未透传: %v", m2["prefix_rule"])
+	}
+
+	// JSON 路径直写 sandbox_permissions 的照常透传。
+	direct := toFunctionArguments(`{"cmd":"x","sandbox_permissions":"require_escalated","justification":"Allow?"}`)
+	var md map[string]any
+	if json.Unmarshal([]byte(direct), &md) != nil || md["sandbox_permissions"] != "require_escalated" {
+		t.Errorf("直写路径应原样透传: %s", direct)
+	}
+
+	// 非法枚举值必须被清洗掉，不能污染客户端的 serde 反序列化。
+	bad := toFunctionArguments(`{"cmd":"x","sandbox_permissions":"with_additional_permissions"}`)
+	var mb map[string]any
+	if json.Unmarshal([]byte(bad), &mb) != nil {
+		t.Fatalf("bad 不是合法 JSON: %s", bad)
+	}
+	if _, exists := mb["sandbox_permissions"]; exists {
+		t.Errorf("未启用的枚举值应被丢弃: %s", bad)
+	}
+}
+
+// 历史回放：放行参数渲染回 needs_approval 别名（不写 sandbox_permissions，
+// 免得模型在历史里看到被禁的参数名又弃权）；非 exec 工具按 tools.<name>(…) 渲染。
+func TestReplayCallTextWithOptions(t *testing.T) {
+	got := replayCallText("exec_command", `{"cmd":"npm install","sandbox_permissions":"require_escalated","justification":"Install dependencies with npm?"}`)
+	if !strings.Contains(got, `needs_approval: "Install dependencies with npm?"`) {
+		t.Errorf("放行参数应渲染为 needs_approval: %s", got)
+	}
+	if strings.Contains(got, "sandbox_permissions") {
+		t.Errorf("回放不应出现 sandbox_permissions 字样: %s", got)
+	}
+	mcp := replayCallText("mcp__ctx7__query_docs", `{"libraryId":"x","query":"y"}`)
+	if !strings.Contains(mcp, "await tools.mcp__ctx7__query_docs({") {
+		t.Errorf("MCP 调用应按原名渲染: %s", mcp)
+	}
+}

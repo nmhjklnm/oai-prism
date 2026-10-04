@@ -125,7 +125,7 @@ func TestBridgeInputItems_DropsCodexBaseInstructions(t *testing.T) {
 		msg("developer", "用户自定义：回答用中文"),
 		msg("user", "你好"),
 	})
-	sys := textOfItem(bridgeInputItems(raw, "")[0])
+	sys := textOfItem(bridgeInputItems(raw, "", nil)[0])
 	for _, gone := range []string{"You are Codex", "base base", "<multi_agent_role>", "<multi_agent_mode>"} {
 		if strings.Contains(sys, gone) {
 			t.Errorf("不应转发 %q", gone)

@@ -162,6 +162,9 @@ type Runner struct {
 	// sandboxes 按账号缓存沙箱。沙箱令牌不绑定项目，按账号缓存即可，
 	// 省掉每次请求都去 POST /api/backend/1/new 的往返与冷启动。
 	sandboxes *sandboxCache
+	// warm 是项目预热池（见 warm.go）：每账号常备几个建好并同步完的项目，
+	// 新会话首轮免付建项目+同步的成本。ProjectWarmPool <= 0 时为 nil。
+	warm *warmPool
 	// uploads 记录已上传到项目的图片，避免每轮把历史里的图片重传一遍。
 	uploads *uploadCache
 	journal *PendingJournal
@@ -187,6 +190,10 @@ func NewRunner(cfg *config.Config, log *slog.Logger, pool *account.Pool, client 
 		journal:        NewPendingJournal(),
 		app:            app,
 		accountRetries: 2,
+	}
+	if cfg.Facade.ProjectWarmPool > 0 && cfg.Facade.ReuseProject {
+		r.warm = newWarmPool(cfg.Facade.ProjectWarmPool)
+		go r.warmLoop(context.Background())
 	}
 	go r.projects.gc(context.Background())
 	go r.sandboxes.gc(context.Background())
@@ -1284,6 +1291,13 @@ func (r *Runner) resolveProject(ctx context.Context, acct *account.Account, req 
 
 	if id, ok := r.projects.Get(acct.ID, bucketKey, time.Now()); ok {
 		r.app.ProjectOps.Inc("reuse", "hit")
+		return id, nil
+	}
+
+	// 预热池优先：新会话首轮免付建项目+沙箱同步的等待（见 warm.go）。
+	// 领到的项目照常进 projects 缓存，后续轮次走 reuse 命中。
+	if id, ok := r.warmTake(acct.ID); ok {
+		r.projects.Put(acct.ID, bucketKey, id, time.Now())
 		return id, nil
 	}
 

@@ -214,16 +214,22 @@ func TestToFunctionArguments(t *testing.T) {
 	}
 
 	// 关键回归测试（用户本次诊断 Bug）：const cmd = String.raw`...` + { cmd, max_output_tokens: 16000 }
+	// 新行为：白名单选项（max_output_tokens / sandbox_permissions 等）随 cmd 一起透传给客户端。
 	userCase := "const cmd = String.raw`\nWrite-Output 'Hello Diagnosis'\nGet-Process\n`;\nconst out = await tools.exec_command({ cmd, max_output_tokens: 16000 });\ntext(out);"
 	args4 := toFunctionArguments(userCase)
-	if err := json.Unmarshal([]byte(args4), &m); err != nil {
+	var m4 map[string]any
+	if err := json.Unmarshal([]byte(args4), &m4); err != nil {
 		t.Fatalf("用户诊断场景失败: %s", args4)
 	}
-	if strings.Contains(m["cmd"], "tools.exec_command") || strings.Contains(m["cmd"], "const out =") {
-		t.Fatalf("提取结果绝不能包含 JS 胶水代码: %q", m["cmd"])
+	cmd4, _ := m4["cmd"].(string)
+	if strings.Contains(cmd4, "tools.exec_command") || strings.Contains(cmd4, "const out =") {
+		t.Fatalf("提取结果绝不能包含 JS 胶水代码: %q", cmd4)
 	}
-	if !strings.Contains(m["cmd"], "Write-Output 'Hello Diagnosis'") || !strings.Contains(m["cmd"], "Get-Process") {
-		t.Fatalf("未能正确提取变量中的命令内容: %q", m["cmd"])
+	if !strings.Contains(cmd4, "Write-Output 'Hello Diagnosis'") || !strings.Contains(cmd4, "Get-Process") {
+		t.Fatalf("未能正确提取变量中的命令内容: %q", cmd4)
+	}
+	if got, _ := m4["max_output_tokens"].(float64); got != 16000 {
+		t.Errorf("max_output_tokens 应原样透传: %v", m4["max_output_tokens"])
 	}
 }
 
@@ -262,7 +268,7 @@ func TestBridgeResultTextArray(t *testing.T) {
 		{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"echo hi\"}"},
 		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed"},{"type":"input_text","text":"{\"chunk_id\":\"x\"}"}]}
 	]`)
-	items := bridgeInputItems(raw, "sys")
+	items := bridgeInputItems(raw, "sys", nil)
 	b, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -285,7 +291,7 @@ func TestBridgeResultTextArray(t *testing.T) {
 // 以为自己的命令丢了，转而要求用户重发内容。
 func TestReplayCallText(t *testing.T) {
 	// JSON 形态（function_call）-> 渲染回 JS
-	got := replayCallText(`{"cmd":"Set-Content -Path 'a.txt' -Value 'hi'"}`)
+	got := replayCallText("exec_command", `{"cmd":"Set-Content -Path 'a.txt' -Value 'hi'"}`)
 	if !strings.Contains(got, "tools.exec_command") || !strings.Contains(got, "Set-Content") {
 		t.Errorf("JSON 参数未渲染成 JS: %s", got)
 	}
@@ -302,10 +308,10 @@ func TestReplayCallText(t *testing.T) {
 	}
 	// JS 形态（custom_tool_call）-> 原样
 	js := `const out = await tools.exec_command({ cmd: "echo hi" });`
-	if replayCallText(js) != js {
-		t.Errorf("JS 应原样回放: %s", replayCallText(js))
+	if replayCallText("exec_command", js) != js {
+		t.Errorf("JS 应原样回放: %s", replayCallText("exec_command", js))
 	}
-	if replayCallText("") != "" {
+	if replayCallText("exec_command", "") != "" {
 		t.Error("空参数应返回空（不伪造内容）")
 	}
 }
@@ -323,7 +329,7 @@ func TestBridgeInputReplayFunctionCall(t *testing.T) {
 		{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"Set-Content -Path 'a.txt' -Value 'hi'\"}"},
 		{"type":"function_call_output","call_id":"c1","output":"Added a.txt (+1 -0)"}
 	]`)
-	items := bridgeInputItems(raw, "sys")
+	items := bridgeInputItems(raw, "sys", nil)
 	b, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -382,7 +388,7 @@ func TestBridgeInputItems(t *testing.T) {
 		{"type":"custom_tool_call_output","call_id":"c1","output":"[CLIENT RESULT]\nfile written\n[/CLIENT RESULT]"},
 		{"type":"reasoning","summary":[]}
 	]`)
-	items := bridgeInputItems(raw, "base")
+	items := bridgeInputItems(raw, "base", nil)
 	if len(items) == 0 {
 		t.Fatal("翻译结果为空")
 	}
@@ -524,7 +530,7 @@ func TestBridgeInputItems_And_FoldInputHistory_MultiTurnToolExecution(t *testing
 		{"type":"message","role":"user","content":"你文件输出的路径在哪里？"}
 	]`
 
-	items := bridgeInputItems([]byte(rawJSON), "default-sys")
+	items := bridgeInputItems([]byte(rawJSON), "default-sys", nil)
 	if len(items) == 0 {
 		t.Fatalf("bridgeInputItems 解析失败")
 	}

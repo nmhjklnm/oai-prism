@@ -274,6 +274,11 @@ type FacadeConfig struct {
 	ProjectTTL      time.Duration `yaml:"project_ttl"`
 	ProjectPoolSize int           `yaml:"project_pool_size"`
 
+	// ProjectWarmPool 是项目预热池容量（每账号常备的"已建好并同步完"的
+	// 项目数）。新会话首轮直接从池里领走，免付建项目+同步的几秒到十几秒；
+	// 后台再补。0 = 关闭（显式写 0 也生效，默认值在 Default 里给）。
+	ProjectWarmPool int `yaml:"project_warm_pool"`
+
 	// 轮询参数。render-status 支持 waitMs 长轮询，
 	// response_with_tools_status 是否支持由 enable_wait_ms 控制。
 	PollInterval   time.Duration `yaml:"poll_interval"`
@@ -542,6 +547,7 @@ func Default() *Config {
 			ReuseProject:        true,
 			ProjectTTL:          30 * time.Minute,
 			ProjectPoolSize:     4,
+			ProjectWarmPool:     2,
 			PollInterval:        DefaultPollInterval,
 			PollWaitMs:          10000,
 			UseStatusWait:       true,

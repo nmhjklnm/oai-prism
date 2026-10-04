@@ -79,14 +79,14 @@ func TestParseApplyPatch(t *testing.T) {
 }
 
 func TestBridgePromptPatchRecipe(t *testing.T) {
-	native := bridgePrompt(true)
+	native := bridgePrompt(true, nil)
 	if !strings.Contains(native, "tools.apply_patch(patch)") || !strings.Contains(native, "NEVER run apply_patch as a shell command") {
 		t.Fatal("有原生 apply_patch 时应推荐 tools.apply_patch")
 	}
 	if strings.Contains(native, "behaves identically on every OS") {
 		t.Fatal("不能再说 heredoc 在各系统上都一样")
 	}
-	if legacy := bridgePrompt(false); !strings.Contains(legacy, "On Windows NEVER use apply_patch heredocs") {
+	if legacy := bridgePrompt(false, nil); !strings.Contains(legacy, "On Windows NEVER use apply_patch heredocs") {
 		t.Fatal("没有原生工具时要说明 heredoc 只适用于 bash")
 	}
 	if !strings.Contains(native, "/prism-uploads/") {

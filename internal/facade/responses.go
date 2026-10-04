@@ -33,6 +33,11 @@ type responsesTurn struct {
 	// nativePatch：客户端在 exec 脚本里提供 tools.apply_patch（见 applypatch.go）。
 	nativePatch bool
 
+	// clientTools：请求里注册的非内建工具（MCP 等，见 clienttools.go）。
+	// 桥指令会列出它们；模型发出的 tools.<name>(…) 调用会被翻译成
+	// 对应的 function_call 交给客户端执行。
+	clientTools []clientTool
+
 	// compaction 标识 Codex 的上下文压缩请求（见 codexRequestKind）：
 	// 回复只能是摘要正文，不能变成工具调用。
 	compaction bool
@@ -122,6 +127,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		execKind:     ExecToolKind(rawFields),
 		compaction:   compaction,
 		nativePatch:  hasNativeApplyPatch(rawFields),
+		clientTools:  registeredClientTools(rawFields),
 	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
 	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
@@ -146,7 +152,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var native *nativeConversation
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
-		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()))
+		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()), turn.clientTools)
 		native = itemsConversation(input)
 		if compaction {
 			input = appendSystemText(input, compactionDirective)
@@ -504,38 +510,38 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			finalRespID = res.ResponseID
 		}
 		if js != "" {
-			callID := newID("ctc_")
-			var item string
-			if turn.execKind == "function" {
-				item = functionCallItemJSON(callID, turn.execToolName, toFunctionArguments(js))
-			} else {
-				item = customToolCallItemJSON(callID, js, turn.execToolName)
-			}
-			done := AppendResponsesEvent(buf[:0], ResponsesEvent{
-				Type: "response.output_item.added", ItemJSON: item,
-			})
-			if err := sw.WriteRaw(done); err != nil {
-				return
-			}
-			if turn.execKind != "function" {
-				// custom_tool_call 专用事件；function_call 没有这一段。
+			items := bridgeOutputItems(turn, js)
+			for _, it := range items {
+				done := AppendResponsesEvent(buf[:0], ResponsesEvent{
+					Type: "response.output_item.added", ItemJSON: it.itemJSON,
+				})
+				if err := sw.WriteRaw(done); err != nil {
+					return
+				}
+				if it.kind == "custom" {
+					// custom_tool_call 专用事件；function_call 没有这一段。
+					done = AppendResponsesEvent(buf[:0], ResponsesEvent{
+						Type: "response.custom_tool_call_input.done", ItemID: it.id, Text: it.input,
+					})
+					if err := sw.WriteRaw(done); err != nil {
+						return
+					}
+				}
 				done = AppendResponsesEvent(buf[:0], ResponsesEvent{
-					Type: "response.custom_tool_call_input.done", ItemID: callID, Text: js,
+					Type: "response.output_item.done", ItemJSON: it.itemJSON,
 				})
 				if err := sw.WriteRaw(done); err != nil {
 					return
 				}
 			}
-			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
-				Type: "response.output_item.done", ItemJSON: item,
-			})
-			if err := sw.WriteRaw(done); err != nil {
-				return
+			jsonItems := make([]string, len(items))
+			for i, it := range items {
+				jsonItems[i] = it.itemJSON
 			}
-			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
+			done := AppendResponsesEvent(buf[:0], ResponsesEvent{
 				Type:       "response.completed",
 				ResponseID: finalRespID, Model: publicModel, CreatedAt: created,
-				OutputJSON: "[" + item + "]",
+				OutputJSON: "[" + strings.Join(jsonItems, ",") + "]",
 				Usage:      usage,
 			})
 			_ = sw.WriteRaw(done)
@@ -677,26 +683,16 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 			js = h.bridgeExecJS(r, turn, text, res)
 		}
 		if js != "" {
-			callID := newID("ctc_")
 			setConversationHeader(w, conversationID)
-			var out any
-			if turn.execKind == "function" {
-				out = map[string]any{
-					"id": callID, "type": "function_call",
-					"status": "completed", "call_id": callID,
-					"name": turn.execToolName, "arguments": toFunctionArguments(js),
-				}
-			} else {
-				out = map[string]any{
-					"id": callID, "type": "custom_tool_call",
-					"status": "completed", "call_id": callID,
-					"name": turn.execToolName, "input": js,
-				}
+			items := bridgeOutputItems(turn, js)
+			out := make([]any, 0, len(items))
+			for _, it := range items {
+				out = append(out, it.asAny)
 			}
 			respMap := map[string]any{
 				"id": finalRespID, "object": "response", "created_at": turn.created,
 				"status": "completed", "model": turn.publicModel,
-				"output": []any{out},
+				"output": out,
 			}
 			if usage != nil {
 				respMap["usage"] = usage

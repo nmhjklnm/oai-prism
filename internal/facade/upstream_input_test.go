@@ -158,7 +158,7 @@ func codexInput(t *testing.T, agentsBody string) json.RawMessage {
 // environment_context 进入桥 system（原样留在 input 里会被上游丢弃），
 // 并且同一条 system 点名作废 Prism 的 AGENTS.md。
 func TestBridgeInputItems_ClientContextMovedIntoSystem(t *testing.T) {
-	items := canonicalUpstreamInput(bridgeInputItems(codexInput(t, "RULE-XYZ: always answer in Chinese"), ""))
+	items := canonicalUpstreamInput(bridgeInputItems(codexInput(t, "RULE-XYZ: always answer in Chinese"), "", nil))
 	if got := roles(items); len(got) != 2 || got[0] != "system" || got[1] != "user" {
 		t.Fatalf("应为 [system, user]，得到 %v", got)
 	}
@@ -180,7 +180,7 @@ func TestBridgeInputItems_ClientContextMovedIntoSystem(t *testing.T) {
 
 func TestBridgeInputItems_ClientInstructionsBudget(t *testing.T) {
 	long := strings.Repeat("规", clientInstructionsBudget+500)
-	sys := textOfItem(bridgeInputItems(codexInput(t, long), "")[0])
+	sys := textOfItem(bridgeInputItems(codexInput(t, long), "", nil)[0])
 	if !strings.Contains(sys, "more characters truncated") {
 		t.Fatal("超出预算的本地规则应截断并注明")
 	}
