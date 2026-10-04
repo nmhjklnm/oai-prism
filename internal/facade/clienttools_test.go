@@ -195,3 +195,39 @@ func TestReplayCallTextWithOptions(t *testing.T) {
 		t.Errorf("MCP 调用应按原名渲染: %s", mcp)
 	}
 }
+
+// 合并上游 goja 求值后的嫁接点：混排块按顺序分组（shell 合成、MCP 独立），
+// 变量引用的 MCP 参数按 JS 语义取值，exec 的 needs_approval 出口还原成 sandbox_permissions。
+func TestBridgeToolCallsGojaGrouping(t *testing.T) {
+	turn := &responsesTurn{
+		execToolName: "exec_command", execKind: "function",
+		clientTools: registeredClientTools(codexToolsRaw()),
+	}
+	js := "const lib = '/vercel/' + 'next.js';\n" +
+		"await tools.exec_command({ cmd: 'pwd' });\n" +
+		"await tools.exec_command({ cmd: 'ls' });\n" +
+		"const r = await tools.mcp__ctx7__query_docs({ libraryId: lib, query: `route ${'handlers'}` });\n" +
+		"await tools.exec_command({ cmd: 'npm install', needs_approval: 'Install deps?' });\n" +
+		"text(r);"
+	calls := bridgeToolCalls(turn, js, false)
+	if len(calls) != 3 {
+		t.Fatalf("应分 3 组（pwd+ls 合成 / MCP / npm），得到 %d: %+v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0].item, `pwd\\nls`) {
+		t.Errorf("连续 shell 调用应合成一条顺序命令: %s", calls[0].item)
+	}
+	if !strings.Contains(calls[1].item, `"name":"mcp__ctx7__query_docs"`) ||
+		!strings.Contains(calls[1].item, `/vercel/next.js`) || !strings.Contains(calls[1].item, `route handlers`) {
+		t.Errorf("MCP 参数应按 JS 语义求值: %s", calls[1].item)
+	}
+	if !strings.Contains(calls[2].item, `sandbox_permissions`) || !strings.Contains(calls[2].item, `require_escalated`) ||
+		strings.Contains(calls[2].item, `needs_approval`) {
+		t.Errorf("needs_approval 应还原为 sandbox_permissions: %s", calls[2].item)
+	}
+
+	// 纯 shell 块不受影响：走上游原路径。
+	plain := bridgeToolCalls(turn, "await tools.exec_command({ cmd: 'echo hi' });", false)
+	if len(plain) != 1 || !strings.Contains(plain[0].item, "echo hi") {
+		t.Errorf("纯 shell 块应走原路径: %+v", plain)
+	}
+}

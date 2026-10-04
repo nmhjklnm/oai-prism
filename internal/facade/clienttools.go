@@ -617,65 +617,105 @@ func normalizeExecArgsJSON(args string) string {
 	return args
 }
 
-// bridgeOutputItem 是一条要发给客户端的工具调用输出条目。
-type bridgeOutputItem struct {
-	id       string
-	kind     string // "function" | "custom"
-	itemJSON string // 流式事件用的条目 JSON
-	asAny    any    // 同步响应用的对象
-	input    string // custom 时给 input.done 事件的原文
+// toolGroup 是 bridgeToolCalls 的一个分组：要么是一段连续 shell 调用重组成的
+// JS（交给上游的 functionCallArgs 合成一条命令），要么是一个客户端工具调用。
+type toolGroup struct {
+	shell  string
+	client *execCall
 }
 
-// bridgeOutputItems 把桥 JS 翻译成 Responses 输出条目。
-// 块里有非内建注册工具的调用 → 逐调用翻译（exec 调用也各自成条）；
-// 否则走单调用的老路径 —— 那条路径带着裸命令包装、胶水剥离等全部加固。
-func bridgeOutputItems(turn *responsesTurn, js string) []bridgeOutputItem {
-	if calls := parseBridgeCalls(js, turn.clientTools, turn.execToolName, turn.execKind); len(calls) > 0 {
-		out := make([]bridgeOutputItem, 0, len(calls))
-		for _, c := range calls {
-			id := newID("ctc_")
-			if c.Kind == "custom" {
-				out = append(out, bridgeOutputItem{
-					id: id, kind: "custom", input: c.Input,
-					itemJSON: customToolCallItemJSON(id, c.Input, c.Name),
-					asAny: map[string]any{
-						"id": id, "type": "custom_tool_call", "status": "completed",
-						"call_id": id, "name": c.Name, "input": c.Input,
-					},
-				})
-				continue
-			}
-			out = append(out, bridgeOutputItem{
-				id: id, kind: "function",
-				itemJSON: functionCallItemJSON(id, c.Name, c.ArgsJSON),
-				asAny: map[string]any{
-					"id": id, "type": "function_call", "status": "completed",
-					"call_id": id, "name": c.Name, "arguments": c.ArgsJSON,
-				},
-			})
+// clientToolGroups 在块里调了客户端注册工具（MCP 等）时，把调用按顺序分组；
+// 块里只有 shell 调用、或客户端没注册任何额外工具时返回 nil（走原路径）。
+//
+// 求值用 goja（evalBridgeJS，参数按 JS 语义取真实值）；求值失败时退回文本
+// 解析（parseBridgeCalls）—— 两条路都只认 registeredClientTools 里的名字，
+// 未注册的调用不会被透传（客户端只会拒绝它）。
+func clientToolGroups(turn *responsesTurn, js string) []toolGroup {
+	if len(turn.clientTools) == 0 || !strings.Contains(js, "tools.") {
+		return nil
+	}
+	names := make([]string, 0, len(turn.clientTools))
+	for _, t := range turn.clientTools {
+		names = append(names, t.Name)
+	}
+	calls, err := evalBridgeJS(js, names)
+	if err != nil {
+		calls = textBridgeCalls(js, turn)
+	}
+	hasClient := false
+	for _, c := range calls {
+		if c.IsClientTool() {
+			hasClient = true
+			break
 		}
-		return out
 	}
-	id := newID("ctc_")
-	if turn.execKind == "function" {
-		args := toFunctionArguments(js)
-		return []bridgeOutputItem{{
-			id: id, kind: "function",
-			itemJSON: functionCallItemJSON(id, turn.execToolName, args),
-			asAny: map[string]any{
-				"id": id, "type": "function_call", "status": "completed",
-				"call_id": id, "name": turn.execToolName, "arguments": args,
-			},
-		}}
+	if !hasClient {
+		return nil
 	}
-	return []bridgeOutputItem{{
-		id: id, kind: "custom", input: js,
-		itemJSON: customToolCallItemJSON(id, js, turn.execToolName),
-		asAny: map[string]any{
-			"id": id, "type": "custom_tool_call", "status": "completed",
-			"call_id": id, "name": turn.execToolName, "input": js,
-		},
-	}}
+	var groups []toolGroup
+	var pending []execCall
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		groups = append(groups, toolGroup{shell: callsToJS(pending)})
+		pending = nil
+	}
+	for i := range calls {
+		c := calls[i]
+		if c.IsClientTool() {
+			flush()
+			groups = append(groups, toolGroup{client: &c})
+			continue
+		}
+		pending = append(pending, c)
+	}
+	flush()
+	return groups
+}
+
+// textBridgeCalls 是 goja 求值失败时的文本兜底：把 parseBridgeCalls 的结果
+// 转成 execCall 序列（exec 的参数经 toFunctionArguments 取出）。
+func textBridgeCalls(js string, turn *responsesTurn) []execCall {
+	var out []execCall
+	for _, c := range parseBridgeCalls(js, turn.clientTools, "exec_command", "function") {
+		var m map[string]any
+		_ = json.Unmarshal([]byte(c.ArgsJSON), &m)
+		if c.IsExec {
+			cmd, _ := m["cmd"].(string)
+			delete(m, "cmd")
+			out = append(out, execCall{Tool: "exec_command", Cmd: cmd, Args: m})
+			continue
+		}
+		if c.Kind == "custom" {
+			m = map[string]any{"input": c.Input}
+		}
+		out = append(out, execCall{Tool: c.Name, Args: m})
+	}
+	return out
+}
+
+// callsToJS 把一段 shell 调用重组成 JS 源码，交还上游的单块路径
+// （functionCallArgs 会再求值一次、合成命令、处理 Windows 超长）。
+func callsToJS(calls []execCall) string {
+	var sb strings.Builder
+	for _, c := range calls {
+		if c.Tool == "apply_patch" {
+			sb.WriteString("await tools.apply_patch(")
+			writeJSONString(&sb, c.Patch)
+			sb.WriteString(");\n")
+			continue
+		}
+		args := map[string]any{"cmd": c.Cmd}
+		for k, v := range c.Args {
+			args[k] = v
+		}
+		b, _ := json.Marshal(args)
+		sb.WriteString("await tools.exec_command(")
+		sb.Write(b)
+		sb.WriteString(");\n")
+	}
+	return sb.String()
 }
 
 // contentPlainText 从 Responses 消息的 content 字段提取纯文本
