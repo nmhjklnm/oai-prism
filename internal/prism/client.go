@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -1853,17 +1854,16 @@ func backoff(base, max time.Duration, attempt int) time.Duration {
 	return d
 }
 
-// fakeRand 是一个极廉价的伪随机，避免为抖动引入 math/rand 的全局锁。
-var randState uint64 = 0x9e3779b97f4a7c15
-
+// fakeRand 取 [0, n) 的抖动随机数。
+//
+// 原先是无锁的全局 xorshift 状态，多个 goroutine 同时重试（预热池建项目、请求同步沙箱）
+// 时读写同一个变量，-race 测试报数据竞争。math/rand/v2 的顶层函数并发安全，
+// 且走运行时的每线程随机源，没有全局锁。
 func fakeRand(n int64) int64 {
-	randState ^= randState << 13
-	randState ^= randState >> 7
-	randState ^= randState << 17
 	if n <= 0 {
 		return 0
 	}
-	return int64(randState % uint64(n))
+	return mrand.Int64N(n)
 }
 
 func parseRetryAfter(v string) time.Duration {

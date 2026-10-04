@@ -505,6 +505,7 @@ func newTestServerWithSrv(t *testing.T, up *fakeUpstream, accounts []config.Acco
 	cfg.Upstream.MaxRetries = 0 // 测试要确定性，不要内部重试干扰断言
 	cfg.Upstream.ForceHTTP2 = false
 	cfg.Upstream.RetryBackoff = time.Millisecond
+	cfg.Facade.StartGap = 0 // 同号错开发起针对真 Prism 的风控，假上游不需要，留着只会拖慢并发用例
 	cfg.Creds.Mode = "static"
 	cfg.Creds.File = filepath.Join(t.TempDir(), "accounts.json")
 	cfg.Creds.AutoRefresh = false
