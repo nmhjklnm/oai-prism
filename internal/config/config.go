@@ -308,6 +308,11 @@ type FacadeConfig struct {
 	// 后台再补。0 = 关闭（显式写 0 也生效，默认值在 Default 里给）。
 	ProjectWarmPool int `yaml:"project_warm_pool"`
 
+	// StartGap 是同一账号相邻两次发起（response_with_tools_start）的最小间隔。
+	// 同号同一瞬间发起多轮时 Prism 只放行一个、其余 403；错开 3 秒实测不再被拒。
+	// 0 = 不错开。
+	StartGap time.Duration `yaml:"start_gap"`
+
 	// 轮询参数。render-status 支持 waitMs 长轮询，
 	// response_with_tools_status 是否支持由 enable_wait_ms 控制。
 	PollInterval   time.Duration `yaml:"poll_interval"`
@@ -578,6 +583,7 @@ func Default() *Config {
 			ProjectTTL:          30 * time.Minute,
 			ProjectPoolSize:     4,
 			ProjectWarmPool:     2,
+			StartGap:            3 * time.Second,
 			PollInterval:        DefaultPollInterval,
 			PollWaitMs:          10000,
 			UseStatusWait:       true,

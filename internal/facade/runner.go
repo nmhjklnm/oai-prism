@@ -165,6 +165,8 @@ type Runner struct {
 	// warm 是项目预热池（见 warm.go）：每账号常备几个建好并同步完的项目，
 	// 新会话首轮免付建项目+同步的成本。ProjectWarmPool <= 0 时为 nil。
 	warm *warmPool
+	// starts 给每个账号的发起排时刻，相邻两次至少隔 facade.start_gap（见 startgate.go）。
+	starts *startGate
 	// uploads 记录已上传到项目的图片，避免每轮把历史里的图片重传一遍。
 	uploads *uploadCache
 	journal *PendingJournal
@@ -189,6 +191,7 @@ func NewRunner(cfg *config.Config, log *slog.Logger, pool *account.Pool, client 
 		uploads:        newUploadCache(cfg.Facade.ProjectTTL),
 		journal:        NewPendingJournal(),
 		app:            app,
+		starts:         newStartGate(),
 		accountRetries: 2,
 	}
 	if cfg.Facade.ProjectWarmPool > 0 && cfg.Facade.ReuseProject {
@@ -533,6 +536,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 这是上游自己建议的处理方式 —— 照做即可，不要当成协议错误。
 	r.log.Info("发给上游的请求参数", "convID", convIDOut, "itemsCount", len(inputItems))
 	for attempt := 1; attempt <= sandboxStartRetries; attempt++ {
+		if serr := r.waitStartSlot(ctx, acct.ID); serr != nil {
+			return result, serr
+		}
 		startResp, err = r.client.StartResponse(ctx, p, &prism.StartRequest{
 			Input:           inputItems,
 			ConversationID:  convIDOut,
