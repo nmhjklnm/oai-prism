@@ -270,6 +270,7 @@ func TestPool_MaxConcurrency(t *testing.T) {
 	p := testPool(t, "least_inflight",
 		config.AccountConfig{ID: "a", AccessToken: "t1", MaxConcurrency: 1},
 	)
+	p.cfg.QueueWait = 0 // 不排队：验证的是"满了不超发"
 
 	l1, err := p.Acquire(context.Background(), "")
 	if err != nil {

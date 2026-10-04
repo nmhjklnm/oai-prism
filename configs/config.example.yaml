@@ -165,6 +165,10 @@ pool:
   # 调用方还拿不到任何有用信息。凭据失效的场景会直接快速失败，不走这里。
   max_wait: 10s
 
+  # 全部账号满并发时，新请求排队等空位最多多久（先来先到），0 = 不排队、立即报错。
+  # 满并发是容量问题：一次模型请求多在一分钟内结束，排队几十秒通常就有空位。
+  queue_wait: 10m
+
   health_check: true
   health_check_path: /api/auth/session
   health_check_interval: 5m

@@ -21,6 +21,9 @@ import (
 // ErrNoAccount 表示池里没有任何可用账号。
 var ErrNoAccount = errors.New("账号池为空或全部不可用")
 
+// ErrPoolBusy 表示全部账号满并发、排队到上限仍没等到空位（容量不足，不是凭据问题）。
+var ErrPoolBusy = fmt.Errorf("%w：全部账号已达并发上限", ErrNoAccount)
+
 // Pool 是账号池与调度器。
 //
 // 无锁读取热路径：账号切片本身用 atomic.Pointer 持有，
@@ -34,6 +37,7 @@ type Pool struct {
 
 	accounts atomic.Pointer[[]*Account]
 	sticky   *stickyMap
+	queue    slotQueue
 
 	rr atomic.Uint64
 
@@ -208,6 +212,11 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		return nil, ErrNoAccount
 	}
 
+	// 已有请求在排队：新来的排到队尾，不能插队抢刚空出来的位置。
+	if p.cfg.QueueWait > 0 && p.queue.size() > 0 {
+		return p.waitInQueue(ctx, stickyKey)
+	}
+
 	if stickyKey != "" {
 		if id, ok := p.sticky.Get(stickyKey, now); ok {
 			for _, a := range all {
@@ -235,11 +244,17 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		}
 	}
 
-	if a := p.pick(all, now); a != nil {
+	if a := p.pick(all, now, stickyKey != ""); a != nil {
 		if stickyKey != "" {
 			p.sticky.Put(stickyKey, a.ID, now)
 		}
 		return &Lease{Account: a, pool: p, key: stickyKey}, nil
+	}
+
+	// 有账号只是满并发（未冷却、凭据可用）：排队等空位，而不是立刻失败 ——
+	// 立刻失败时客户端（Codex 默认重试 5 次、约 6 秒）多半等不到空位，整轮作废。
+	if p.cfg.QueueWait > 0 && anyBusy(all, now) {
+		return p.waitInQueue(ctx, stickyKey)
 	}
 
 	// 全部不可用：等最早解除冷却的那个，而不是直接失败。
@@ -292,9 +307,163 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		}
 	}
 	if busy == len(all) {
-		return nil, fmt.Errorf("%w: 全部 %d 个账号已达并发上限", ErrNoAccount, len(all))
+		return nil, fmt.Errorf("%w（%d 个号）", ErrPoolBusy, len(all))
 	}
 	return nil, ErrNoAccount
+}
+
+// Prefer 在会话还没有粘性记录时把它绑到账号 id。
+//
+// 粘性表只在内存里，网关重启后是空的；原生续接的绑定（会话在哪个号的哪个上游对话里）
+// 却落了盘。不先绑回去，新选号可能把老会话分到另一个号，上游对话随之作废、整段重发。
+func (p *Pool) Prefer(key, id string) {
+	if key == "" || id == "" || p.Get(id) == nil {
+		return
+	}
+	now := time.Now()
+	if _, ok := p.sticky.Get(key, now); ok {
+		return
+	}
+	p.sticky.Put(key, id, now)
+}
+
+// waitInQueue 在全部账号满并发时排队等空位，先来先到：只有排在空位数以内的去抢，
+// 粘性账号空出来优先用它，否则用任一空出来的号（与 waitSticky 等满后改绑同一取舍）。
+// 等满 pool.queue_wait 仍无空位返回 ErrPoolBusy；账号全部冷却或凭据失效时不再干等。
+func (p *Pool) waitInQueue(ctx context.Context, stickyKey string) (*Lease, error) {
+	limit := p.cfg.QueueWait
+	ticket, ahead := p.queue.enter()
+	defer p.queue.leave(ticket)
+	started := time.Now()
+	p.log.Info("账号并发已满，排队等空位", "ahead", ahead, "limit", limit)
+
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-t.C:
+		}
+		now := time.Now()
+		all := p.Accounts()
+		// 前面排着的人数小于空位数才去抢：一次空出几个位就放行几个，顺序仍按先来先到。
+		if pos := p.queue.position(ticket); pos >= 0 && pos < freeSlots(all, now) {
+			if l := p.takeSlot(all, stickyKey, now); l != nil {
+				p.log.Info("排队拿到空位", "account", l.Account.ID,
+					"waited", now.Sub(started).Round(time.Millisecond))
+				return l, nil
+			}
+		}
+		if !anyBusy(all, now) && !anyAvailable(all, now) {
+			return nil, fmt.Errorf("%w：排队期间账号全部进入冷却或凭据失效", ErrNoAccount)
+		}
+		if now.Sub(started) >= limit {
+			p.log.Warn("排队超时", "waited", limit, "accounts", len(all))
+			return nil, fmt.Errorf("%w（%d 个号），排队 %s 仍无空位", ErrPoolBusy, len(all), limit)
+		}
+	}
+}
+
+// takeSlot 尝试领一个空位：粘性账号优先，否则按策略选号。
+func (p *Pool) takeSlot(all []*Account, stickyKey string, now time.Time) *Lease {
+	if stickyKey != "" {
+		if id, ok := p.sticky.Get(stickyKey, now); ok {
+			if a := p.Get(id); a != nil && a.Available(now) && a.Acquire(now) {
+				p.sticky.Put(stickyKey, a.ID, now)
+				return &Lease{Account: a, pool: p, key: stickyKey}
+			}
+		}
+	}
+	if a := p.pick(all, now, stickyKey != ""); a != nil {
+		if stickyKey != "" {
+			p.sticky.Put(stickyKey, a.ID, now)
+		}
+		return &Lease{Account: a, pool: p, key: stickyKey}
+	}
+	return nil
+}
+
+func anyBusy(all []*Account, now time.Time) bool {
+	for _, a := range all {
+		if a.Busy(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// freeSlots 是当前能立即领到的空位数（不限并发的号按很大计）。
+func freeSlots(all []*Account, now time.Time) int {
+	n := 0
+	for _, a := range all {
+		if !a.Available(now) {
+			continue
+		}
+		if a.maxConc <= 0 {
+			return 1 << 30
+		}
+		n += int(a.maxConc - a.inflight.Load())
+	}
+	return n
+}
+
+func anyAvailable(all []*Account, now time.Time) bool {
+	for _, a := range all {
+		if a.Available(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// QueueLen 是当前排队等空位的请求数。
+func (p *Pool) QueueLen() int { return p.queue.size() }
+
+// slotQueue 是满并发时的先来先到队列。
+type slotQueue struct {
+	mu      sync.Mutex
+	next    uint64
+	waiting []uint64
+}
+
+// enter 领号排队，返回号码与前面还有几个。
+func (q *slotQueue) enter() (uint64, int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.next++
+	ahead := len(q.waiting)
+	q.waiting = append(q.waiting, q.next)
+	return q.next, ahead
+}
+
+func (q *slotQueue) leave(ticket uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, t := range q.waiting {
+		if t == ticket {
+			q.waiting = append(q.waiting[:i], q.waiting[i+1:]...)
+			return
+		}
+	}
+}
+
+// position 是 ticket 前面还有几个在排，-1 = 不在队里。
+func (q *slotQueue) position(ticket uint64) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, t := range q.waiting {
+		if t == ticket {
+			return i
+		}
+	}
+	return -1
+}
+
+func (q *slotQueue) size() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.waiting)
 }
 
 // waitSticky 在粘性账号满并发时短暂等待其空出槽位。
@@ -329,7 +498,11 @@ func (p *Pool) waitSticky(ctx context.Context, a *Account, stickyKey string) *Le
 }
 
 // pick 依据策略选一个可用账号。
-func (p *Pool) pick(all []*Account, now time.Time) *Account {
+//
+// binding 为 true 表示选中的号会绑定一个会话（带会话键的请求）：least_inflight 先比
+// 各号已绑定的会话数，再比在途数。只比在途数时，空闲时刻开的会话全落在排第一的号上，
+// 等它们同时干活，第一个号满员、另一个号闲着。
+func (p *Pool) pick(all []*Account, now time.Time, binding bool) *Account {
 	switch p.cfg.Strategy {
 	case "round_robin":
 		n := len(all)
@@ -375,18 +548,24 @@ func (p *Pool) pick(all []*Account, now time.Time) *Account {
 		// least_inflight：在途数最少者优先，平票取权重高者。
 		// 这是代理场景的默认最优解——它天然把慢请求摊开，
 		// 避免 round_robin 把新请求继续压在已经拥堵的账号上。
+		// 绑定会话的请求先比已绑定会话数（见函数注释）。
+		var bound map[string]int
+		if binding {
+			bound = p.sticky.boundSessions(now)
+		}
 		var best *Account
-		var bestScore float64
+		var bestSess, bestScore float64
 		for _, a := range all {
 			if !a.Available(now) {
 				continue
 			}
-			score := float64(a.inflight.Load())
+			sess, score := float64(bound[a.ID]), float64(a.inflight.Load())
 			if a.Weight > 0 {
+				sess /= float64(a.Weight)
 				score /= float64(a.Weight)
 			}
-			if best == nil || score < bestScore {
-				best, bestScore = a, score
+			if best == nil || sess < bestSess || (sess == bestSess && score < bestScore) {
+				best, bestSess, bestScore = a, sess, score
 			}
 		}
 		if best != nil && best.Acquire(now) {
@@ -762,6 +941,22 @@ func (s *stickyMap) Put(key, accountID string, now time.Time) {
 	sh.mu.Lock()
 	sh.m[key] = stickyEntry{accountID: accountID, expires: now.Add(s.ttl)}
 	sh.mu.Unlock()
+}
+
+// boundSessions 统计各账号当前绑定的会话数（未过期的粘性记录）。
+func (s *stickyMap) boundSessions(now time.Time) map[string]int {
+	out := make(map[string]int, 4)
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for _, e := range sh.m {
+			if !now.After(e.expires) {
+				out[e.accountID]++
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return out
 }
 
 func (s *stickyMap) Delete(key string) {

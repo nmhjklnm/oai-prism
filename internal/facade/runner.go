@@ -334,7 +334,15 @@ func (r *Runner) acquire(ctx context.Context, req *RunRequest) (*account.Lease, 
 			r.app.AccountPick.Inc("pinned_busy")
 		}
 	}
+	// 会话已有上游对话（落盘的续接绑定）而粘性表没记录（网关重启过 / 粘性过期）：
+	// 先按绑定的号认回来，免得选号把它分到别的号、上游对话作废。
+	r.pool.Prefer(req.StickyKey, req.BoundAccountID)
 	lease, err := r.pool.Acquire(ctx, req.StickyKey)
+	if errors.Is(err, account.ErrPoolBusy) {
+		r.app.AccountPick.Inc("busy")
+		return nil, fmt.Errorf("%w。可在 %s 调大 max_concurrency、加账号，或调大 pool.queue_wait",
+			err, r.cfg.Creds.File)
+	}
 	if err != nil {
 		r.app.AccountPick.Inc("empty")
 		// 把凭据文件位置写进错误里：这是首次部署最常见的问题，

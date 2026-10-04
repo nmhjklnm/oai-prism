@@ -247,7 +247,10 @@ type PoolConfig struct {
 
 	// MaxWait 是"全池冷却时最多等多久"。
 	// 超过就直接报错，而不是让调用方挂在一个注定超时的请求上。
-	MaxWait         time.Duration `yaml:"max_wait"`
+	MaxWait time.Duration `yaml:"max_wait"`
+	// QueueWait 是"全部账号满并发时排队等空位最多多久"，0 = 不排队（立即报错）。
+	// 满并发是容量问题，几十秒内常有空位；与冷却不同，值得等。
+	QueueWait       time.Duration `yaml:"queue_wait"`
 	CooldownBackoff float64       `yaml:"cooldown_backoff"` // 每次追加冷却的倍率
 	MaxCooldown     time.Duration `yaml:"max_cooldown"`
 
@@ -538,6 +541,7 @@ func Default() *Config {
 			CooldownBackoff:     2,
 			MaxCooldown:         30 * time.Minute,
 			MaxWait:             10 * time.Second,
+			QueueWait:           10 * time.Minute,
 			HealthCheck:         true,
 			HealthCheckPath:     "/api/auth/session",
 			HealthCheckInterval: 5 * time.Minute,

@@ -85,11 +85,11 @@ func registeredClientTools(raw map[string]json.RawMessage) []clientTool {
 	walk = func(ts []json.RawMessage, ns string) {
 		for _, t := range ts {
 			var d struct {
-				Type        string          `json:"type"`
-				Name        string          `json:"name"`
-				Description string          `json:"description"`
-				Parameters  json.RawMessage `json:"parameters"`
-				InputSchema json.RawMessage `json:"input_schema"`
+				Type        string            `json:"type"`
+				Name        string            `json:"name"`
+				Description string            `json:"description"`
+				Parameters  json.RawMessage   `json:"parameters"`
+				InputSchema json.RawMessage   `json:"input_schema"`
 				Tools       []json.RawMessage `json:"tools"`
 			}
 			if json.Unmarshal(t, &d) != nil {
@@ -115,7 +115,7 @@ func registeredClientTools(raw map[string]json.RawMessage) []clientTool {
 	if items, ok := rawJSONList(raw["input"]); ok {
 		for _, it := range items {
 			var d struct {
-				Type  string          `json:"type"`
+				Type  string            `json:"type"`
 				Tools []json.RawMessage `json:"tools"`
 			}
 			if json.Unmarshal(it, &d) != nil || d.Type != "additional_tools" {

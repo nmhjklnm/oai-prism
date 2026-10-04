@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oai-prism/oaiprism/internal/account"
 	"github.com/oai-prism/oaiprism/internal/creds"
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
@@ -356,6 +357,9 @@ func mapError(err error) (int, string, string) {
 		return http.StatusGatewayTimeout, "timeout", "等待上游响应超时"
 	case errors.Is(err, ErrPollTimeout):
 		return http.StatusGatewayTimeout, "timeout", err.Error()
+	case errors.Is(err, account.ErrPoolBusy):
+		// 容量不足而非上游故障：503 让客户端知道稍后重试即可。
+		return http.StatusServiceUnavailable, "server_busy", err.Error()
 	}
 
 	var ae *creds.APIError
