@@ -633,6 +633,27 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		r.app.FacadeFirstByte.Observe(result.FirstDelta.Seconds(), req.API)
 	}
 
+	// 生成途中的思考摘要（codex_live_progress，见 prism.CodexLiveProgress）：每条立刻推给
+	// 下游，与官方前端的灰色思考一致。同一行可能在相邻两次轮询里重复出现（重试、游标回退），
+	// 按 transcript 行号去重。不算首字（指标衡量的是正文首字延迟）。
+	seenSummary := map[int]bool{}
+	emitLiveReasoning := func(st *prism.StatusResponse) error {
+		if emit == nil {
+			return nil
+		}
+		for _, sm := range st.LiveReasoning {
+			text := strings.TrimSpace(sm.Text)
+			if text == "" || seenSummary[sm.LineIndex] {
+				continue
+			}
+			seenSummary[sm.LineIndex] = true
+			if err := emit(Delta{Reasoning: text}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// 3) start 有可能直接就是终态（回答很短，或者立刻失败了）。
 	if st := startResp.Initial; st != nil {
 		if st.Fail {
@@ -796,6 +817,10 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		}
 		if len(st.ListenSnapshot) > 0 {
 			result.ListenSnapshot = st.ListenSnapshot
+		}
+		if eerr := emitLiveReasoning(st); eerr != nil {
+			r.stopUpstream(p, requestID, convID, turnState)
+			return result, eerr
 		}
 
 		if st.Delta != "" {

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+
+	"github.com/oai-prism/oaiprism/internal/sse"
 )
 
 // web_search_call 合成展示。
@@ -114,4 +116,59 @@ func lastUserQuestion(raw map[string]json.RawMessage) string {
 	}
 	best = strings.TrimSpace(strings.TrimSuffix(best, localExecReminder))
 	return best
+}
+
+// writeReasoningItem 把一条思考摘要作为独立的 reasoning 条目流给客户端：
+// output_item.added → summary_part.added → summary_text.delta → summary_text.done →
+// summary_part.done → output_item.done。Codex 把它渲染成思考区块（与官方 Prism 页面的
+// 灰色思考同源：上游 codex_live_progress.reasoningSummaries）。
+//
+// 每条摘要单独成一个条目：上游是一行一条地给，到一条发一条，不必等同一条目收尾。
+func writeReasoningItem(sw *sse.Writer, text string) error {
+	text = formatSummaryHeading(text)
+	id := newID("rs_")
+	var item strings.Builder
+	item.WriteString(`{"id":`)
+	writeJSONString(&item, id)
+	item.WriteString(`,"type":"reasoning","summary":[]}`)
+	var done strings.Builder
+	done.WriteString(`{"id":`)
+	writeJSONString(&done, id)
+	done.WriteString(`,"type":"reasoning","summary":[{"type":"summary_text","text":`)
+	writeJSONString(&done, text)
+	done.WriteString(`}],"encrypted_content":null}`)
+
+	var buf []byte
+	for _, ev := range []ResponsesEvent{
+		{Type: "response.output_item.added", ItemJSON: item.String()},
+		{Type: "response.reasoning_summary_part.added", ItemID: id},
+		{Type: "response.reasoning_summary_text.delta", ItemID: id, Text: text},
+		{Type: "response.reasoning_summary_text.done", ItemID: id, Text: text},
+		{Type: "response.reasoning_summary_part.done", ItemID: id, Text: text},
+		{Type: "response.output_item.done", ItemJSON: done.String()},
+	} {
+		buf = AppendResponsesEvent(buf[:0], ev)
+		if err := sw.WriteRaw(buf); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// formatSummaryHeading 把上游 "**标题** 正文" 的单行形态还原成 "**标题**\n\n正文"：
+// Codex 以首行的 **…** 作为思考状态标题，正文另起段落。
+func formatSummaryHeading(text string) string {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "**") {
+		return t
+	}
+	end := strings.Index(t[2:], "**")
+	if end < 0 {
+		return t
+	}
+	head, rest := t[:end+4], strings.TrimSpace(t[end+4:])
+	if rest == "" {
+		return head
+	}
+	return head + "\n\n" + rest
 }

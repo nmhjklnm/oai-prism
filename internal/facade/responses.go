@@ -483,10 +483,16 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 	}
 
 	if turn.bridge {
-		// 桥模式不能边收边发：必须先拿到完整回复才能判断它是
+		// 桥模式不能边收边发正文：必须先拿到完整回复才能判断它是
 		// 工具调用（```codex-exec 块）还是纯文本，缓冲后统一输出。
+		// 思考摘要例外（半流式）：它不会变成工具调用，到一条立刻发一条（见 writeReasoningItem）。
 		var sb strings.Builder
 		emit := func(d Delta) error {
+			if d.Reasoning != "" && !turn.compaction {
+				if err := writeReasoningItem(sw, d.Reasoning); err != nil {
+					return err
+				}
+			}
 			sb.WriteString(d.Text)
 			return nil
 		}

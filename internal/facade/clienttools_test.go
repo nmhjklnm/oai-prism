@@ -231,3 +231,33 @@ func TestBridgeToolCallsGojaGrouping(t *testing.T) {
 		t.Errorf("纯 shell 块应走原路径: %+v", plain)
 	}
 }
+
+func TestFormatSummaryHeading(t *testing.T) {
+	cases := map[string]string{
+		"**Preparing pages** I need to check.": "**Preparing pages**\n\nI need to check.",
+		"**Only title**":                       "**Only title**",
+		"plain text no heading":                "plain text no heading",
+		"**unclosed heading text":              "**unclosed heading text",
+	}
+	for in, want := range cases {
+		if got := formatSummaryHeading(in); got != want {
+			t.Errorf("formatSummaryHeading(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// 思考事件字段必须满足 Codex 的解析要求（delta+summary_index / item_id+text+summary_index）。
+func TestReasoningSummaryEvents(t *testing.T) {
+	ev := string(AppendResponsesEvent(nil, ResponsesEvent{Type: "response.reasoning_summary_text.delta", ItemID: "rs_1", Text: "hi"}))
+	for _, want := range []string{`"item_id":"rs_1"`, `"summary_index":0`, `"delta":"hi"`} {
+		if !strings.Contains(ev, want) {
+			t.Errorf("delta 事件缺 %s: %s", want, ev)
+		}
+	}
+	done := string(AppendResponsesEvent(nil, ResponsesEvent{Type: "response.reasoning_summary_text.done", ItemID: "rs_1", Text: "hi"}))
+	for _, want := range []string{`"item_id":"rs_1"`, `"summary_index":0`, `"text":"hi"`} {
+		if !strings.Contains(done, want) {
+			t.Errorf("done 事件缺 %s: %s", want, done)
+		}
+	}
+}

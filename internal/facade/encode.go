@@ -217,6 +217,9 @@ type ResponsesEvent struct {
 	// item 形状各写一个硬编码分支。
 	ItemJSON   string
 	OutputJSON string
+
+	// SummaryIndex 是 reasoning_summary_* 事件的摘要段序号（Codex 解析时必填）。
+	SummaryIndex int
 }
 
 // AppendResponsesEvent 编码一个 Responses API SSE 事件。
@@ -286,6 +289,37 @@ func AppendResponsesEvent(dst []byte, e ResponsesEvent) []byte {
 		dst = append(dst, `,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, `,"annotations":[]}]}}`...)
+
+	// 思考摘要（reasoning item）：Codex 按 summary_index 归段，.delta 需 delta+summary_index，
+	// .done 需 item_id+text+summary_index（codex-api sse/responses.rs）。
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		dst = append(dst, `{"type":`...)
+		dst = sse.AppendJSONString(dst, e.Type)
+		dst = append(dst, `,"item_id":`...)
+		dst = sse.AppendJSONString(dst, e.ItemID)
+		dst = append(dst, `,"output_index":0,"summary_index":`...)
+		dst = sse.AppendInt(dst, int64(e.SummaryIndex))
+		dst = append(dst, `,"part":{"type":"summary_text","text":`...)
+		dst = sse.AppendJSONString(dst, e.Text)
+		dst = append(dst, `}}`...)
+
+	case "response.reasoning_summary_text.delta":
+		dst = append(dst, `{"type":"response.reasoning_summary_text.delta","item_id":`...)
+		dst = sse.AppendJSONString(dst, e.ItemID)
+		dst = append(dst, `,"output_index":0,"summary_index":`...)
+		dst = sse.AppendInt(dst, int64(e.SummaryIndex))
+		dst = append(dst, `,"delta":`...)
+		dst = sse.AppendJSONString(dst, e.Text)
+		dst = append(dst, '}')
+
+	case "response.reasoning_summary_text.done":
+		dst = append(dst, `{"type":"response.reasoning_summary_text.done","item_id":`...)
+		dst = sse.AppendJSONString(dst, e.ItemID)
+		dst = append(dst, `,"output_index":0,"summary_index":`...)
+		dst = sse.AppendInt(dst, int64(e.SummaryIndex))
+		dst = append(dst, `,"text":`...)
+		dst = sse.AppendJSONString(dst, e.Text)
+		dst = append(dst, '}')
 
 	case "response.custom_tool_call_input.done":
 		dst = append(dst, `{"type":"response.custom_tool_call_input.done","item_id":`...)

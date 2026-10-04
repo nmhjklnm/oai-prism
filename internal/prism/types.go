@@ -333,6 +333,8 @@ type StatusResponse struct {
 	Reset          bool
 	Reasoning      string
 	ReasoningDelta string
+	// LiveReasoning 是本次 pending 轮询带回的新思考摘要（见 CodexLiveProgress）。
+	LiveReasoning []LiveSummary
 
 	// OutputItems 是上游返回的确定性 Response 条目列表（支持 message, function_call, reasoning 等）。
 	OutputItems []CodexOutputItem
@@ -406,6 +408,19 @@ type CodexPayload struct {
 	RootCause      string            `json:"rootCause,omitempty"`
 }
 
+// CodexLiveProgress 是 pending 轮询里的实时进度（codex_live_progress）。
+type CodexLiveProgress struct {
+	TranscriptCursor   int           `json:"transcriptCursor"`
+	LineCount          int           `json:"lineCount"`
+	ReasoningSummaries []LiveSummary `json:"reasoningSummaries"`
+}
+
+// LiveSummary 是一条思考摘要（transcript 里的一行；line_index 全会话唯一，用于去重）。
+type LiveSummary struct {
+	LineIndex int    `json:"line_index"`
+	Text      string `json:"text"`
+}
+
 // PrismEnvelope 是上游轮询接口 /api/llm/* 的确定性外层包络结构。
 type PrismEnvelope struct {
 	Status         string          `json:"status"` // "started", "pending", "completed", "error"
@@ -418,7 +433,12 @@ type PrismEnvelope struct {
 	// transcript_cursor 等）。下一轮 start 必须原样回传 —— 多轮续接的
 	// 另一半钥匙（另一半是 previousResponseId）。真实 Web 每轮都带。
 	ListenSnapshot json.RawMessage `json:"codex_listen_snapshot,omitempty"`
-	Response       *struct {
+	// LiveProgress 是生成途中（pending）的实时进度：上游把沙箱 codex 会话
+	// transcript 自上次轮询以来的新行归类后附上。官方前端的灰色思考摘要就来自
+	// 其中的 reasoningSummaries（2026-10-05 对照官方页面网络实测）；toolCalls /
+	// eventPreviews 在联网搜索时也是空的 —— 搜索过程上游不对外给。
+	LiveProgress *CodexLiveProgress `json:"codex_live_progress,omitempty"`
+	Response     *struct {
 		Status  string        `json:"status"` // "success", "error"
 		Payload *CodexPayload `json:"payload"`
 	} `json:"response,omitempty"`

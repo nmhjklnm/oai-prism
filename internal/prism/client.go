@@ -801,6 +801,9 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 			Status:         strings.ToLower(strings.TrimSpace(env.Status)),
 			Usage:          env.Usage,
 		}
+		if env.LiveProgress != nil {
+			out.LiveReasoning = env.LiveProgress.ReasoningSummaries
+		}
 		if env.Message != "" && out.Status == "error" {
 			out.Fail = true
 			out.Done = true
