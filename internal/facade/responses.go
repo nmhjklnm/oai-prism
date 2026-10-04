@@ -38,6 +38,10 @@ type responsesTurn struct {
 	// 对应的 function_call 交给客户端执行。
 	clientTools []clientTool
 
+	// userQuery：本轮用户的原始提问（见 websearch.go 的 lastUserQuestion），
+	// 用于合成 web_search_call 展示条目的查询词。
+	userQuery string
+
 	// compaction 标识 Codex 的上下文压缩请求（见 codexRequestKind）：
 	// 回复只能是摘要正文，不能变成工具调用。
 	compaction bool
@@ -128,6 +132,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		compaction:   compaction,
 		nativePatch:  hasNativeApplyPatch(rawFields),
 		clientTools:  registeredClientTools(rawFields),
+		userQuery:    lastUserQuestion(rawFields),
 	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
 	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
@@ -549,7 +554,26 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 
 		// 纯文本：桥模式下一次性给出（模型已完整生成，无需伪增量）。
-		_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, stripExecFence(text), usage)
+		// 答案带真实引用时，先合成 web_search_call 展示条目（见 websearch.go）：
+		// 顺序是 搜索 → 打开来源 → 答案，但与答案同时到达（桥整段返回）。
+		shown := stripExecFence(text)
+		if items := synthesizedSearchItems(shown, turn.userQuery); len(items) > 0 && !turn.compaction {
+			for _, it := range items {
+				done := AppendResponsesEvent(buf[:0], ResponsesEvent{
+					Type: "response.output_item.added", ItemJSON: it,
+				})
+				if err := sw.WriteRaw(done); err != nil {
+					return
+				}
+				done = AppendResponsesEvent(buf[:0], ResponsesEvent{
+					Type: "response.output_item.done", ItemJSON: it,
+				})
+				if err := sw.WriteRaw(done); err != nil {
+					return
+				}
+			}
+		}
+		_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, shown, usage)
 		return
 	}
 
@@ -701,6 +725,28 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 			return
 		}
 		text = stripExecFence(text)
+	}
+	// 桥模式的纯文本答案带真实引用时，先合成 web_search_call 展示条目
+	//（顺序：搜索 → 打开来源 → 答案；与答案同时返回，见 websearch.go）。
+	if turn.bridge && !turn.compaction {
+		if items := synthesizedSearchOutputs(synthesizedSearchItems(text, turn.userQuery)); len(items) > 0 {
+			items = append(items, map[string]any{
+				"type": "message", "id": newID("msg_"), "role": "assistant", "status": "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": text}},
+			})
+			respMap := map[string]any{
+				"id": finalRespID, "object": "response", "created_at": turn.created,
+				"status": "completed", "model": turn.publicModel, "output": items,
+			}
+			if usage != nil {
+				respMap["usage"] = usage
+			}
+			if conversationID != "" {
+				setConversationHeader(w, conversationID)
+			}
+			writeJSON(w, http.StatusOK, respMap)
+			return
+		}
 	}
 	resp := ResponsesResponse{
 		ID:        finalRespID,

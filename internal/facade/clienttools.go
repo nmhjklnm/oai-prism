@@ -678,6 +678,31 @@ func bridgeOutputItems(turn *responsesTurn, js string) []bridgeOutputItem {
 	}}
 }
 
+// contentPlainText 从 Responses 消息的 content 字段提取纯文本
+// （字符串或 [{type:text,text:…}] 数组两种形态）。
+func contentPlainText(r json.RawMessage) string {
+	if len(r) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(r, &s) == nil {
+		return s
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(r, &parts) == nil {
+		var sb strings.Builder
+		for _, p := range parts {
+			sb.WriteString(p.Text)
+		}
+		if sb.Len() > 0 {
+			return sb.String()
+		}
+	}
+	return ""
+}
+
 func stringIn(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
