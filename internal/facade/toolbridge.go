@@ -424,6 +424,8 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 		Arguments json.RawMessage `json:"arguments"`
 		Output    json.RawMessage `json:"output"`
 		Content   json.RawMessage `json:"content"`
+		// 远端压缩的产物（见 compaction.go）。
+		EncryptedContent string `json:"encrypted_content"`
 	}
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil
@@ -656,16 +658,24 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 
 			items = append(items, prism.NewUserItem(
 				header+"\n"+out+"\n[/CLIENT RESULT]"))
+		case "compaction_trigger":
+			// 远端压缩：触发条目不带提示词，由网关补上（见 compaction.go）。
+			items = append(items, prism.NewUserItem(compactionTriggerPrompt))
+		case "compaction", "compaction_summary":
+			// 远端压缩的产物：解回上游写的摘要，原生续接据此接回同一个会话。
+			items = append(items, prism.NewUserItem(compactionHistoryText(b.EncryptedContent)))
 		default:
 			// additional_tools / reasoning / 其它非消息条目：跳过。
 		}
 	}
 
-	// 克服大模型注意力衰减：在最后一个 user 消息结尾注入近邻强制提醒
+	// 克服大模型注意力衰减：在最后一个 user 消息结尾注入近邻强制提醒。
+	// 压缩请求（本地压缩与远端压缩的提示词都以这句开头）只要摘要，不接"必须发 codex-exec"。
 	for i := len(items) - 1; i >= 0; i-- {
 		if strings.EqualFold(items[i].Role, "user") && len(items[i].Content) > 0 {
 			lastText := items[i].Content[len(items[i].Content)-1].Text
-			if !strings.Contains(lastText, "[LOCAL_EXECUTION_REMINDER]") {
+			if !strings.Contains(lastText, "[LOCAL_EXECUTION_REMINDER]") &&
+				!strings.Contains(lastText, "CONTEXT CHECKPOINT COMPACTION") {
 				items[i].Content[len(items[i].Content)-1].Text += localExecReminder
 			}
 			break

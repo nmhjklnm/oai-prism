@@ -45,6 +45,9 @@ type responsesTurn struct {
 	// compaction 标识 Codex 的上下文压缩请求（见 codexRequestKind）：
 	// 回复只能是摘要正文，不能变成工具调用。
 	compaction bool
+	// remoteCompaction 是远端压缩（input 带 compaction_trigger，见 compaction.go）：
+	// 摘要要包成唯一一条 compaction 条目返回，而不是 assistant 消息。
+	remoteCompaction bool
 }
 
 // codexRequestKind 取 Codex 在 x-codex-turn-metadata 里标注的请求种类（turn / compaction …）。
@@ -77,7 +80,8 @@ func codexRequestKind(r *http.Request, raw map[string]json.RawMessage) string {
 // codex-exec，压缩这一轮只要摘要正文。
 const compactionDirective = "<context_checkpoint>\n" +
 	"This request is a CONTEXT CHECKPOINT. Reply with the handoff summary as plain text only. " +
-	"Do NOT emit a ```codex-exec block and do not run any command: nothing is executed for this reply.\n" +
+	"Do NOT emit a ```codex-exec block and do not run any command: nothing is executed for this reply. " +
+	"This applies to this reply only: do not write it into the summary as a goal or constraint.\n" +
 	"</context_checkpoint>"
 
 // handleResponses 实现 POST /v1/responses（OpenAI 新一代 Responses API）。
@@ -114,25 +118,29 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// 本地 CLI 当手脚，见 toolbridge.go 顶部注释。
 	bridge := BridgeEnabled(rawFields)
 	compaction := codexRequestKind(r, rawFields) == "compaction"
-	if compaction && !bridge && strings.Contains(string(rawFields["input"]), `"function_call"`) {
+	remoteCompaction := hasCompactionTrigger(rawFields["input"])
+	compaction = compaction || remoteCompaction
+	if compaction && !bridge && (remoteCompaction || strings.Contains(string(rawFields["input"]), `"function_call"`)) {
 		// 压缩请求不带工具声明；历史里有工具往返时仍按桥翻译，
 		// 否则工具调用与结果被当成非消息条目丢掉，摘要里就没有做过的操作。
+		// 远端压缩的触发条目也只有桥认得（见 compaction.go）。
 		bridge = true
 	}
 	toolsStr := string(rawFields["tools"])
 	hasTools := toolsStr != "" && toolsStr != "null" && toolsStr != "[]"
 	turn := &responsesTurn{
-		id:           newID("resp_"),
-		created:      time.Now().Unix(),
-		publicModel:  req.Model,
-		stream:       req.Stream,
-		bridge:       bridge,
-		execToolName: ExecToolName(rawFields),
-		execKind:     ExecToolKind(rawFields),
-		compaction:   compaction,
-		nativePatch:  hasNativeApplyPatch(rawFields),
-		clientTools:  registeredClientTools(rawFields),
-		userQuery:    lastUserQuestion(rawFields),
+		id:               newID("resp_"),
+		created:          time.Now().Unix(),
+		publicModel:      req.Model,
+		stream:           req.Stream,
+		bridge:           bridge,
+		execToolName:     ExecToolName(rawFields),
+		execKind:         ExecToolKind(rawFields),
+		compaction:       compaction,
+		remoteCompaction: remoteCompaction,
+		nativePatch:      hasNativeApplyPatch(rawFields),
+		clientTools:      registeredClientTools(rawFields),
+		userQuery:        lastUserQuestion(rawFields),
 	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
 	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
@@ -520,6 +528,21 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		if res != nil && res.ResponseID != "" {
 			finalRespID = res.ResponseID
 		}
+		if turn.remoteCompaction {
+			// 远端压缩：摘要包成唯一一条 compaction 条目（见 compaction.go）。
+			item := compactionItemJSON(stripExecFence(text))
+			for _, e := range []ResponsesEvent{
+				{Type: "response.output_item.added", ItemJSON: item},
+				{Type: "response.output_item.done", ItemJSON: item},
+				{Type: "response.completed", ResponseID: finalRespID, Model: publicModel, CreatedAt: created,
+					OutputJSON: "[" + item + "]", Usage: usage},
+			} {
+				if err := sw.WriteRaw(AppendResponsesEvent(buf[:0], e)); err != nil {
+					return
+				}
+			}
+			return
+		}
 		if js != "" {
 			var items []string
 			for _, call := range bridgeToolCalls(turn, js, isWindowsClient(r)) {
@@ -750,6 +773,19 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		finalRespID = res.ResponseID
 	}
 
+	if turn.remoteCompaction {
+		respMap := map[string]any{
+			"id": finalRespID, "object": "response", "created_at": turn.created,
+			"status": "completed", "model": turn.publicModel,
+			"output": []any{json.RawMessage(compactionItemJSON(stripExecFence(text)))},
+		}
+		if usage != nil {
+			respMap["usage"] = usage
+		}
+		setConversationHeader(w, conversationID)
+		writeJSON(w, http.StatusOK, respMap)
+		return
+	}
 	if turn.bridge {
 		js := ""
 		if !turn.compaction {
