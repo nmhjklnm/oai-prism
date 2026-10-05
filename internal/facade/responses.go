@@ -704,7 +704,11 @@ func bridgeToolCalls(turn *responsesTurn, js string, isWindows bool) []bridgeToo
 				if b, err := json.Marshal(g.client.Args); err == nil {
 					args = string(b)
 				}
-				out = append(out, bridgeToolCall{id: id, item: functionCallItemJSON(id, g.client.Tool, args)})
+				ns, name := "", g.client.Tool
+				if t, ok := clientToolByName(turn.clientTools, g.client.Tool); ok && t.NS != "" {
+					ns, name = t.NS, t.Base
+				}
+				out = append(out, bridgeToolCall{id: id, item: namespacedFunctionCallItemJSON(id, ns, name, args)})
 				continue
 			}
 			out = append(out, shellToolCalls(turn, g.shell, isWindows)...)

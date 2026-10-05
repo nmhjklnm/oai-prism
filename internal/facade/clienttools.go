@@ -23,6 +23,12 @@ import (
 //（{"type":"namespace","name":"mcp__xx","tools":[…]}）；完整工具名是
 // <namespace>__<name>，与官方的 mcp__{server}__{tool} 一致。
 // 非 lite 路径是平铺数组，名字已带全前缀。
+//
+// 给模型看的是完整名，回给客户端时要拆回两段：Codex 按 function_call 的
+// namespace + name 找 handler（codex-rs core/src/tools/router.rs build_tool_call），
+// 只给拼好的完整名会落到默认命名空间，回 "unsupported call"。2026-10-05 实测
+// 咕咕把自己的工具设为直接调用（code_mode.direct_only_tool_namespaces），
+// mcp__gugu__session_open_in_tab 等调用全部因此失败。
 
 // builtinToolNames 是桥指令已单独文档化的内建工具，不进 CLIENT TOOLS 清单。
 var builtinToolNames = map[string]bool{
@@ -38,6 +44,8 @@ var isExecToolCallName = map[string]bool{
 // clientTool 是一个客户端注册的可调用工具。
 type clientTool struct {
 	Name   string // 完整名（namespace__tool 或原名）
+	NS     string // 所属 namespace（平铺工具为空）
+	Base   string // namespace 内的名字（平铺工具同 Name）
 	Kind   string // "function" | "custom"
 	Desc   string // 描述（已截断）
 	Args   string // 参数名一行（"q (required), lib (optional)" 形态）
@@ -54,8 +62,9 @@ func registeredClientTools(raw map[string]json.RawMessage) []clientTool {
 		if name == "" || builtinToolNames[name] || seen[name] {
 			return
 		}
+		base := name
 		if ns != "" {
-			name = ns + "__" + name
+			name = joinToolName(ns, name)
 			if builtinToolNames[name] || seen[name] {
 				return
 			}
@@ -73,6 +82,8 @@ func registeredClientTools(raw map[string]json.RawMessage) []clientTool {
 		}
 		out = append(out, clientTool{
 			Name:   name,
+			NS:     ns,
+			Base:   base,
 			Kind:   kind,
 			Desc:   firstParagraph(desc, 600),
 			Args:   paramsSummary(params),
@@ -125,6 +136,28 @@ func registeredClientTools(raw map[string]json.RawMessage) []clientTool {
 		}
 	}
 	return out
+}
+
+// joinToolName 把 namespace 与组内名字拼成给模型看的完整名。
+func joinToolName(ns, name string) string {
+	switch {
+	case ns == "":
+		return name
+	case strings.HasSuffix(ns, "__"):
+		return ns + name
+	default:
+		return ns + "__" + name
+	}
+}
+
+// clientToolByName 按完整名找注册工具。
+func clientToolByName(tools []clientTool, name string) (clientTool, bool) {
+	for _, t := range tools {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return clientTool{}, false
 }
 
 // rawJSONList 把 JSON 数组字段解析为元素列表。

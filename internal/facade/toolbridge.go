@@ -217,6 +217,19 @@ func isUnforwardedDeveloper(text string) bool {
 		strings.HasPrefix(t, "<multi_agent_mode>")
 }
 
+// isTurnAbortedNotice 认出用户打断一轮后 Codex 插进历史的 <turn_aborted> developer 消息。
+//
+// 它说的是对话里某个时刻发生的事，不是常驻指令。当 developer 消息并进 system 时，
+// 每打断一次 system 就变一次：原生续接按 system 指纹判断要不要整份重发，于是打断
+// 之后的下一轮把几十 KB 的 system 重发一遍（2026-10-05 实测 79 KB）。留在时间线上，
+// 原位换成一句说明。
+func isTurnAbortedNotice(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "<turn_aborted>")
+}
+
+const turnAbortedNote = "[The user interrupted the previous turn on purpose. Commands from it may have partially run, " +
+	"or may still be running in the background.]"
+
 // foldInputHistory 把 input 的中间历史折叠进首条 system。
 //
 // 上游只读「最后一条 system + 最后一条 user」，中间的 input 条目
@@ -412,10 +425,11 @@ func osDirective(ua string) string {
 // 由调用方解析一次传入）：列进桥指令，模型才知道有 MCP 等工具可调。
 func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []clientTool) []prism.InputItem {
 	var blocks []struct {
-		Type   string `json:"type"`
-		Role   string `json:"role"`
-		Name   string `json:"name"`
-		CallID string `json:"call_id"`
+		Type      string `json:"type"`
+		Role      string `json:"role"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"` // namespace 组里工具的调用（回放时拼回完整名）
+		CallID    string `json:"call_id"`
 		// 工具调用的参数：custom_tool_call 用 input，function_call 用 arguments。
 		// 两者都要读 —— 只读 input 时，CLI v0.159（function 形状）的历史回放
 		// 会变成**空块**，模型回看自己上一轮的命令什么都看不到，于是要求用户
@@ -489,6 +503,8 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 			switch {
 			case (role == "developer" || role == "system") && isUnforwardedDeveloper(txt):
 				// 不转发（见 isUnforwardedDeveloper）
+			case role == "developer" && isTurnAbortedNotice(txt):
+				// 留在对话里（见 isTurnAbortedNotice），不进 system
 			case role == "developer" || role == "system":
 				if devSystem.Len() > 0 {
 					devSystem.WriteString("\n\n")
@@ -535,6 +551,10 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 		switch typ {
 		case "message":
 			role := strings.ToLower(strings.TrimSpace(b.Role))
+			if role == "developer" && isTurnAbortedNotice(contentText(b.Content)) {
+				items = append(items, prism.NewUserItem(turnAbortedNote))
+				continue
+			}
 			if role == "developer" || role == "system" {
 				// 已集中合并进首条 System 消息，跳过
 				continue
@@ -565,7 +585,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 			}
 			call = safeTruncateOutput(call, 6000)
 			items = append(items, prism.NewAssistantItem(
-				"```codex-exec\n"+replayCallText(b.Name, call)+"\n```"))
+				"```codex-exec\n"+replayCallText(joinToolName(b.Namespace, b.Name), call)+"\n```"))
 		case "custom_tool_call_output", "function_call_output":
 			header := "[CLIENT RESULT]"
 			if b.CallID != "" || b.Name != "" {
@@ -1338,11 +1358,21 @@ func customToolCallItemJSON(id, js, toolName string) string {
 // 回传形状必须是 function_call + JSON arguments；回成 custom_tool_call
 // 时客户端找不到 handler，静默不执行（下一轮被 normalize 补成 aborted）。
 func functionCallItemJSON(id, name, args string) string {
+	return namespacedFunctionCallItemJSON(id, "", name, args)
+}
+
+// namespacedFunctionCallItemJSON 同 functionCallItemJSON，ns 非空时带上 namespace 字段
+// （namespace 组里的工具，name 是组内名字，见 clienttools.go）。
+func namespacedFunctionCallItemJSON(id, ns, name, args string) string {
 	var sb strings.Builder
 	sb.WriteString(`{"id":`)
 	writeJSONString(&sb, id)
 	sb.WriteString(`,"type":"function_call","status":"completed","call_id":`)
 	writeJSONString(&sb, id)
+	if ns != "" {
+		sb.WriteString(`,"namespace":`)
+		writeJSONString(&sb, ns)
+	}
 	sb.WriteString(`,"name":`)
 	writeJSONString(&sb, name)
 	sb.WriteString(`,"arguments":`)

@@ -261,3 +261,77 @@ func TestReasoningSummaryEvents(t *testing.T) {
 		}
 	}
 }
+
+// namespace 组里的工具：给模型看完整名，回给客户端拆回 namespace + 组内名字 ——
+// Codex 按这两段找 handler，只给完整名会回 "unsupported call"。回放历史时再拼回完整名。
+func TestBridgeToolCallsNamespaced(t *testing.T) {
+	raw := map[string]json.RawMessage{"tools": json.RawMessage(`[
+ {"type":"custom","name":"exec","description":"Run JS"},
+ {"type":"namespace","name":"mcp__gugu","tools":[
+  {"type":"function","name":"session_open_in_tab","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}
+ ]}
+]`)}
+	turn := &responsesTurn{execToolName: "exec", execKind: "custom", clientTools: registeredClientTools(raw)}
+	if len(turn.clientTools) != 1 || turn.clientTools[0].Name != "mcp__gugu__session_open_in_tab" {
+		t.Fatalf("应登记完整名: %+v", turn.clientTools)
+	}
+	calls := bridgeToolCalls(turn, "const r = await tools.mcp__gugu__session_open_in_tab({ path: 'a.html' });\ntext(r);", false)
+	if len(calls) != 1 {
+		t.Fatalf("应得 1 条调用: %+v", calls)
+	}
+	var item struct{ Type, Namespace, Name, Arguments string }
+	if err := json.Unmarshal([]byte(calls[0].item), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.Type != "function_call" || item.Namespace != "mcp__gugu" || item.Name != "session_open_in_tab" ||
+		!strings.Contains(item.Arguments, "a.html") {
+		t.Fatalf("应拆成 namespace + 组内名字: %s", calls[0].item)
+	}
+
+	// 平铺工具不带 namespace。
+	flat := bridgeToolCalls(&responsesTurn{execToolName: "exec_command", execKind: "function",
+		clientTools: registeredClientTools(codexToolsRaw())},
+		"await tools.mcp__ctx7__query_docs({ libraryId: 'x', query: 'y' });", false)
+	if len(flat) != 1 || strings.Contains(flat[0].item, `"namespace"`) || !strings.Contains(flat[0].item, `"name":"mcp__ctx7__query_docs"`) {
+		t.Fatalf("平铺工具应保持原名、不带 namespace: %+v", flat)
+	}
+
+	// 客户端回传的历史带 namespace：回放成完整名。
+	hist := `[{"type":"function_call","call_id":"c1","namespace":"mcp__gugu","name":"session_open_in_tab","arguments":"{\"path\":\"a.html\"}"},
+ {"type":"function_call_output","call_id":"c1","output":"opened"}]`
+	var got strings.Builder
+	for _, it := range bridgeInputItems(json.RawMessage(hist), "", nil) {
+		got.WriteString(itemText(it))
+	}
+	if !strings.Contains(got.String(), "tools.mcp__gugu__session_open_in_tab(") {
+		t.Fatalf("回放应拼回完整名: %s", got.String())
+	}
+}
+
+func TestJoinToolName(t *testing.T) {
+	for _, c := range [][3]string{{"", "a", "a"}, {"mcp__gugu", "x", "mcp__gugu__x"}, {"mcp__gugu__", "x", "mcp__gugu__x"}} {
+		if got := joinToolName(c[0], c[1]); got != c[2] {
+			t.Errorf("joinToolName(%q,%q)=%q want %q", c[0], c[1], got, c[2])
+		}
+	}
+}
+
+// 打断提示留在时间线上、不进 system：system 不因打断而变（否则原生续接要整份重发 system）。
+func TestTurnAbortedStaysInTimeline(t *testing.T) {
+	base := `{"type":"message","role":"developer","content":[{"type":"input_text","text":"RULES"}]},
+ {"type":"message","role":"user","content":[{"type":"input_text","text":"do it"}]}`
+	aborted := `,{"type":"message","role":"developer","content":[{"type":"input_text","text":"<turn_aborted>\nThe previous turn was interrupted on purpose.\n</turn_aborted>"}]},
+ {"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}`
+	before := bridgeInputItems(json.RawMessage("["+base+"]"), "", nil)
+	after := bridgeInputItems(json.RawMessage("["+base+aborted+"]"), "", nil)
+	if itemText(before[0]) != itemText(after[0]) {
+		t.Fatal("打断提示不应改变 system")
+	}
+	var timeline strings.Builder
+	for _, it := range after[1:] {
+		timeline.WriteString(itemText(it) + "\n")
+	}
+	if !strings.Contains(timeline.String(), turnAbortedNote) || strings.Index(timeline.String(), turnAbortedNote) > strings.Index(timeline.String(), "again") {
+		t.Fatalf("打断说明应在原位: %s", timeline.String())
+	}
+}
