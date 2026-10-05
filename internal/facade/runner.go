@@ -298,7 +298,7 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		}
 
 		// 超限是请求本身的问题，不记到账号头上。
-		if errors.Is(err, ErrContextTooLarge) {
+		if errors.Is(err, ErrMessageTooLarge) {
 			r.app.FacadeRuns.Inc(api, req.Model, "too_large")
 			return res, err
 		}
@@ -442,6 +442,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 先于图片上传 —— 被上游丢弃的中间条目里的图片没必要上传；用量也只按这份计。
 	inputItems := r.upstreamPromptItems(req)
 	convIDOut := req.ConversationID
+	// seeded 是本轮之前已补种进新会话的消息：上游实际读了它们，用量要算上。
+	var seeded []prism.InputItem
 	if req.Native != nil {
 		// 原生续接：会话 ID 由我们登记，续接时只发增量。
 		inputItems = r.planNative(ctx, p, acct.ID, projectID, req, inputItems)
@@ -451,8 +453,15 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				if cerr := ctx.Err(); cerr != nil {
 					return result, cerr
 				}
-				r.log.Warn("原生续接：历史补种失败，本轮改发全量（裁剪后）", "cid", convIDOut, "err", err)
+				if req.Native.plan.fallback == nil {
+					return result, err
+				}
+				r.log.Warn("原生续接：补种失败，本轮改发全量（裁剪后）", "cid", convIDOut, "err", err)
 				inputItems = req.Native.plan.fallback
+			} else {
+				for _, s := range req.Native.plan.seeds {
+					seeded = append(seeded, s...)
+				}
 			}
 		}
 	}
@@ -462,8 +471,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	if projectID != "" {
 		inputItems, hasNewUpload = r.attachImages(ctx, p, acct.ID, projectID, inputItems)
 	}
-	// 用量按真正发往上游的条目计（图片预处理之后），与上游生成并行计数
-	inputTokens := countInputAsync(inputItems)
+	// 用量按真正发往上游的条目计（图片预处理之后，连同补种的消息），与上游生成并行计数
+	inputTokens := countInputAsync(append(seeded, inputItems...))
 	if req.Native != nil && req.Native.plan.continued {
 		// 增量只是上游会话的一小段：模型每轮读的是整段会话，用量按完整上下文计
 		// （Codex 也据此判断窗口占用、决定何时压缩）。
@@ -1257,12 +1266,12 @@ func sandboxReason(resp *prism.StartResponse) string {
 	return resp.Initial.Error
 }
 
-// upstreamFailure 把上游的失败终态转成 Go error：单条超限转成 contextTooLargeError
-// （预检的上限比上游小，正常到不了这里；上游若收紧了限制，客户端照样拿到
-// context_length_exceeded，而不是一个会被无限重试的 server_error）。
+// upstreamFailure 把上游的失败终态转成 Go error：单条超限转成 messageTooLargeError
+// （预检与拆分的上限比上游小，正常到不了这里；上游若收紧了限制，客户端照样拿到
+// 明确、不可重试的 invalid_prompt，而不是一个会被无限重试的 server_error）。
 func (r *Runner) upstreamFailure(st *prism.StatusResponse, items []prism.InputItem, tokens func() int) error {
 	if isUpstreamTooLarge(st.Error) {
-		return &contextTooLargeError{
+		return &messageTooLargeError{
 			Bytes: promptBytes(items), Limit: r.cfg.Facade.PromptByteLimit(),
 			Tokens: tokens(), Upstream: st.Error,
 		}

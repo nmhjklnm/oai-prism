@@ -291,9 +291,9 @@ type FacadeConfig struct {
 	// MaxPromptBytes 是发往上游的单条提示词（合并后的 system + 最后一条 user）的
 	// UTF-8 字节上限。上游按字节而不是 token 限长：2026-10-04 实测合计 102,299 字节
 	// 可过、104,560 字节报 "This request is too large to send"（约 100 KiB），与内容
-	// 是中文还是英文无关。新建上游会话时按它决定历史随首轮一条发完还是分段补种（见
-	// internal/facade/native.go）；本轮内容本身就超限的请求不再发出，直接以
-	// context_length_exceeded 失败。
+	// 是中文还是英文无关。这是单条消息的上限，不是上下文窗口。一轮放不下时按它拆开、
+	// 先在同一个上游会话里分段补种（见 internal/facade/split.go、native.go）；拆不开的
+	// 请求不再发出，以 invalid_prompt 失败。
 	// 默认 96 KiB，给上游自己的包装文本留余量；设为 -1 关闭检查。
 	MaxPromptBytes int `yaml:"max_prompt_bytes"`
 

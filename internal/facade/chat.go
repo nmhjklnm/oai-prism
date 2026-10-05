@@ -60,8 +60,8 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		h.attachNative(runReq, &nativeTurn{key: runReq.StickyKey, strong: isStrongSessionKey(runReq.StickyKey), conv: conv})
 	}
 
-	// 超过上游单条上限：流开始之前就以 400 context_length_exceeded 回绝（见 context_limit.go）。
-	if err := h.runner.checkPromptSize(runReq); writeContextTooLarge(w, err) {
+	// 超过上游单条上限且拆不开：流开始之前就以 400 invalid_prompt 回绝（见 context_limit.go）。
+	if err := h.runner.checkPromptSize(runReq); writeMessageTooLarge(w, err) {
 		middleware.RecordLogError(r, "chat 提示词超限: %v", err)
 		return
 	}
@@ -189,8 +189,8 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 			middleware.RecordLogError(r, "chat 流式失败: %v", runErr)
 			buf = append(buf[:0], `{"error":{"message":`...)
 			buf = sse.AppendJSONString(buf, runErr.Error())
-			if errors.Is(runErr, ErrContextTooLarge) {
-				buf = append(buf, `,"type":"invalid_request_error","code":"context_length_exceeded"}}`...)
+			if errors.Is(runErr, ErrMessageTooLarge) {
+				buf = append(buf, `,"type":"invalid_request_error","code":"invalid_prompt"}}`...)
 			} else {
 				buf = append(buf, `,"type":"upstream_error"}}`...)
 			}
@@ -253,7 +253,7 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogResult(r, res)
 	if err != nil {
-		if writeContextTooLarge(w, err) {
+		if writeMessageTooLarge(w, err) {
 			middleware.RecordLogError(r, "chat 同步失败: %v", err)
 			return
 		}

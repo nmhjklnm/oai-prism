@@ -490,7 +490,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 	fail := func(runErr error) {
 		h.log.Error("responses 流式失败", "err", runErr, "chainKey", turn.chainKey)
 		middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
-		// error.code 决定 Codex 怎么处理：context_length_exceeded 触发压缩，其余当断线重连。
+		// error.code 决定 Codex 怎么处理：invalid_prompt 结束本轮（不动窗口），其余当断线重连。
 		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel,
 			CreatedAt: created, Text: runErr.Error(), Status: responsesErrorCode(runErr)})
 		_ = sw.WriteRaw(buf)
@@ -752,7 +752,7 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 	res, err := h.runResponses(r, runReq, nil)
 	if err != nil {
 		h.log.Error("responses 同步失败", "err", err, "chainKey", turn.chainKey)
-		if writeContextTooLarge(w, err) {
+		if writeMessageTooLarge(w, err) {
 			middleware.RecordLogError(r, "responses 同步失败: %v", err)
 			return
 		}

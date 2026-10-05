@@ -69,6 +69,7 @@ git clone -b bridge-mcp-warm https://github.com/nmhjklnm/oai-prism.git
 | 同号错开发起 | 同一账号相邻两次发起至少隔几秒，避免同一瞬间发起被上游拒绝 | `facade.start_gap` |
 | 提前签好 Sentinel 令牌 | 后台先签好备用，请求来了直接拿，省掉每次签名的等待 | `upstream.sentinel_presign` |
 | 技能清单单独补种 | 本机技能太多、首轮超过上游单条约 100 KiB 上限时，system 里只留名字和路径，带描述的完整清单在新会话开头单独发一轮，保证送到 | — |
+| 单条超限拆开补种 | 一轮超过上游单条约 100 KiB 上限时，拆开在同一会话里先补种再发本轮，不再报错；真拆不开时回 `invalid_prompt`，不会让 Codex 误以为窗口满了而压缩 | `facade.max_prompt_bytes` |
 
 细节与实测数据见[架构与原理](docs/架构与原理.md)。
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -172,67 +174,103 @@ func TestE2E_Bridge_OversizeHistoryTrimmed(t *testing.T) {
 	}
 }
 
-// TestE2E_Bridge_OversizeTurnFailsFast：本轮内容本身就超限（裁历史也救不了）时不发上游，
-// 以 context_length_exceeded 失败 —— server_error 会被 Codex 当断线重连 5 次
-// （2026-10-04 实测 Reconnecting... 1/5、2/5，一次重试 5 分钟）。
-func TestE2E_Bridge_OversizeTurnFailsFast(t *testing.T) {
-	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = 20000 })
-	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses",
-		codexBody(t, "turn", codexMsg("user", "开始"), codexMsg("user", strings.Repeat("长", 8000))),
-		map[string]string{"Content-Type": "application/json"})
-	if code != http.StatusOK || !strings.Contains(out, `"type":"response.failed"`) ||
-		!strings.Contains(out, `"code":"context_length_exceeded"`) {
-		t.Fatalf("应以 response.failed + context_length_exceeded 收尾 (%d): %.400s", code, out)
+// TestE2E_Bridge_OversizeTurnSplit：本轮内容本身就超过单条上限时不报错，而是在同一个上游会话里
+// 先把前几段补种进去、最后一段随本轮发出；每条都在上限内，内容一行不丢。
+func TestE2E_Bridge_OversizeTurnSplit(t *testing.T) {
+	const limit = 20000
+	up := &fakeUpstream{t: t}
+	ts, _ := newTestServer(t, up, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
+	var big strings.Builder
+	for k := 1; k <= 30; k++ {
+		fmt.Fprintf(&big, "LINE-%02d %s\n", k, strings.Repeat("长", 300))
 	}
-	if n := startCount(up); n != 0 {
-		t.Fatalf("超限请求不应发往上游，实际 %d 次", n)
+	big.WriteString("最后的问题：一共几行？")
+	hdr := map[string]string{"Content-Type": "application/json", "X-Oaiprism-Session": "split-turn"}
+	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses", codexBody(t, "turn", codexMsg("user", big.String())), hdr)
+	if code != http.StatusOK || !strings.Contains(out, "response.completed") {
+		t.Fatalf("超长的一轮应拆开后照常完成 (%d): %.400s", code, out)
+	}
+	n := startCount(up)
+	if n < 2 {
+		t.Fatalf("应先补种再发本轮，共 %d 次 start", n)
+	}
+	cid := startConv(t, up, 0)
+	var all strings.Builder
+	for i := 0; i < n; i++ {
+		items := upstreamInput(t, up, i)
+		_, user := requireSystemUser(t, items)
+		if l := promptLen(items); l > limit {
+			t.Fatalf("第 %d 次 start %d 字节，超过上限 %d", i+1, l, limit)
+		}
+		if startConv(t, up, i) != cid {
+			t.Fatalf("第 %d 次 start 不在同一个上游会话里", i+1)
+		}
+		all.WriteString(user)
+	}
+	_, last := requireSystemUser(t, upstreamInput(t, up, n-1))
+	if !strings.HasPrefix(last, "[The user's message for this turn, part ") || !strings.Contains(last, "最后的问题") {
+		t.Fatalf("最后一次 start 应是本轮消息的最后一段: %.120q", last)
+	}
+	for k := 1; k <= 30; k++ {
+		if !strings.Contains(all.String(), fmt.Sprintf("LINE-%02d ", k)) {
+			t.Fatalf("拆分后丢了 LINE-%02d", k)
+		}
+	}
+	// 用量要算上补种的段：上游实际读了全部 9000 个"长"，不能只按最后一段计。
+	m := regexp.MustCompile(`"input_tokens":(\d+)`).FindAllStringSubmatch(out, -1)
+	if len(m) == 0 {
+		t.Fatal("response.completed 里没有 input_tokens")
+	}
+	if in, _ := strconv.Atoi(m[len(m)-1][1]); in < 9000 {
+		t.Fatalf("输入用量 %d 没算上补种的段", in)
 	}
 }
 
-// TestE2E_OversizeRejectedBeforeStream：Chat 与 Anthropic 在流开始前以 400 回绝，
-// 文案各按协议约定（Claude Code 认 "prompt is too long"）。
-func TestE2E_OversizeRejectedBeforeStream(t *testing.T) {
-	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = 4000 })
-	big := strings.Repeat("长", 2000)
+// TestE2E_OversizeSplitAcrossAPIs：Chat、Anthropic、非桥 Responses 的超长一轮同样拆开补种，
+// 不再在流开始前回绝。
+func TestE2E_OversizeSplitAcrossAPIs(t *testing.T) {
+	const limit = 20000
+	up := &fakeUpstream{t: t}
+	ts, _ := newTestServer(t, up, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
+	big := strings.Repeat("长 ", 10000)
 	hdr := map[string]string{"Content-Type": "application/json"}
-
-	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/chat/completions",
-		`{"model":"gpt-5","stream":true,"messages":[{"role":"user","content":"`+big+`"}]}`, hdr)
-	if code != http.StatusBadRequest || !strings.Contains(out, `"code":"context_length_exceeded"`) {
-		t.Fatalf("chat 应 400 context_length_exceeded，得到 %d: %.300s", code, out)
-	}
-
-	code, out = doLocal(t, http.MethodPost, ts.URL+"/v1/messages",
-		`{"model":"gpt-5","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"`+big+`"}]}`, hdr)
-	if code != http.StatusBadRequest || !strings.Contains(out, `"type":"invalid_request_error"`) ||
-		!strings.Contains(out, "prompt is too long: ") {
-		t.Fatalf("anthropic 应 400 prompt is too long，得到 %d: %.300s", code, out)
-	}
-
-	code, out = doLocal(t, http.MethodPost, ts.URL+"/v1/responses", `{"model":"gpt-5","input":"`+big+`"}`, hdr)
-	if code != http.StatusBadRequest || !strings.Contains(out, `"code":"context_length_exceeded"`) {
-		t.Fatalf("responses 同步应 400 context_length_exceeded，得到 %d: %.300s", code, out)
-	}
-	if n := startCount(up); n != 0 {
-		t.Fatalf("超限请求不应发往上游，实际 %d 次", n)
+	for _, tc := range []struct{ path, body string }{
+		{"/v1/chat/completions", `{"model":"gpt-5","stream":true,"messages":[{"role":"user","content":"` + big + `"}]}`},
+		{"/v1/messages", `{"model":"gpt-5","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"` + big + `"}]}`},
+		{"/v1/responses", `{"model":"gpt-5","input":"` + big + `"}`},
+	} {
+		before := startCount(up)
+		if code, out := doLocal(t, http.MethodPost, ts.URL+tc.path, tc.body, hdr); code != http.StatusOK {
+			t.Fatalf("%s 超长的一轮应拆开后完成，得到 %d: %.300s", tc.path, code, out)
+		}
+		after := startCount(up)
+		if after-before < 2 {
+			t.Fatalf("%s 应先补种再发本轮，只发了 %d 次", tc.path, after-before)
+		}
+		for i := before; i < after; i++ {
+			if l := promptLen(upstreamInput(t, up, i)); l > limit {
+				t.Fatalf("%s 第 %d 次 start %d 字节，超过上限", tc.path, i-before+1, l)
+			}
+		}
 	}
 }
 
-// TestE2E_UpstreamTooLargeMapsToContextCode：上游自己报超限（比如它收紧了限制）
-// 也要变成 context_length_exceeded，而不是会被无限重试的 server_error。
-func TestE2E_UpstreamTooLargeMapsToContextCode(t *testing.T) {
+// TestE2E_UpstreamTooLargeMapsToInvalidPrompt：上游自己报单条超限（比如它收紧了限制）
+// 要变成不可重试、也不动窗口的 invalid_prompt，而不是会被无限重试的 server_error，
+// 更不是让 Codex 把窗口记满的 context_length_exceeded。
+func TestE2E_UpstreamTooLargeMapsToInvalidPrompt(t *testing.T) {
 	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
 	hdr := map[string]string{"Content-Type": "application/json"}
 
 	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses",
 		`{"model":"too-large-model","stream":true,"input":"你好"}`, hdr)
-	if code != http.StatusOK || !strings.Contains(out, `"code":"context_length_exceeded"`) {
-		t.Fatalf("流式应以 context_length_exceeded 失败 (%d): %.400s", code, out)
+	if code != http.StatusOK || !strings.Contains(out, `"code":"invalid_prompt"`) || strings.Contains(out, "context_length_exceeded") {
+		t.Fatalf("流式应以 invalid_prompt 失败 (%d): %.400s", code, out)
 	}
 
 	code, out = doLocal(t, http.MethodPost, ts.URL+"/v1/chat/completions",
 		`{"model":"too-large-model","messages":[{"role":"user","content":"你好"}]}`, hdr)
-	if code != http.StatusBadRequest || !strings.Contains(out, `"code":"context_length_exceeded"`) {
-		t.Fatalf("chat 同步应 400 context_length_exceeded，得到 %d: %.300s", code, out)
+	if code != http.StatusBadRequest || !strings.Contains(out, `"code":"invalid_prompt"`) {
+		t.Fatalf("chat 同步应 400 invalid_prompt，得到 %d: %.300s", code, out)
 	}
 }

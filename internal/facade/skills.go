@@ -13,7 +13,7 @@ import (
 // Codex 把本机全部技能（名字 + 描述 + SKILL.md 路径）作为一条 <skills_instructions>
 // developer 消息发来，桥把它并进 system。技能一多它就是 system 里最大的一块：
 // 2026-10-05 实测一个 Codex 客户端带着 235 个技能，这一块 70 KB，首轮合计 109 KB，
-// 超过上游单条约 100 KiB 的上限，一句 "hi" 都发不出去（context_length_exceeded）。
+// 超过上游单条约 100 KiB 的上限，一句 "hi" 都发不出去。
 //
 // 这份清单是 Codex 认定模型必须知道的指令，不能删，也不能交给模型"需要时去读"
 // （读不读由它决定，等于可能没送到）。所以 system 超过单条上限的 skillsCompactShare

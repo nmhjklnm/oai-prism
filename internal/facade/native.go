@@ -449,8 +449,13 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 			}
 			items, sysHash, since := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
 			plan.cid, plan.continued, plan.sysHash, plan.sinceSys = b.cid, true, sysHash, since
-			r.log.Info("原生续接：发送增量", "key", nt.key, "cid", b.cid,
-				"newEntries", len(rest), "bytes", promptBytes(items), "fullSystem", textOfSystem(items) != nativeBriefSystem)
+			// 增量本身放不下（本轮贴了大段内容、工具结果很长）：前面几段先补种进同一个会话。
+			// 补种失败没有可退的全量（会话里已有历史），fallback 留空，由 runOnce 直接报错。
+			if seeds, split := splitOversize(items, r.cfg.Facade.PromptByteLimit()); len(seeds) > 0 {
+				plan.seeds, items = seeds, split
+			}
+			r.log.Info("原生续接：发送增量", "key", nt.key, "cid", b.cid, "newEntries", len(rest),
+				"seedParts", len(plan.seeds), "bytes", promptBytes(items), "fullSystem", textOfSystem(items) != nativeBriefSystem)
 			return items
 		}
 		r.log.Info("原生续接：客户端历史与上游会话对不上，新建会话", "key", nt.key, "oldCid", b.cid)
@@ -468,32 +473,32 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 	plan.sysHash = textFingerprint(nt.conv.system)
 	plan.sinceSys = len(itemText(nt.conv.current))
 
-	// 移出 system 的完整技能清单：新会话里先补种，排在历史之前（见 skills.go）。
-	skillSeeds := skillsSeedTurns(req.Skills, r.cfg.Facade.PromptByteLimit())
-
+	// 新会话里要先补种的：移出 system 的完整技能清单（见 skills.go）、一条放不下的历史，
+	// 最后是本轮仍放不下时拆出的前几段（见 split.go）。补种失败就改发 full（裁剪后的全量）。
+	limit := r.cfg.Facade.PromptByteLimit()
+	seeds := skillsSeedTurns(req.Skills, limit)
+	skillParts, historyParts := len(seeds), 0
+	items := full
 	// 历史一条放不下（全量折叠时被裁过）：先分段把历史补种进新会话，再发本轮 ——
 	// 换号、网关重启、旧会话作废之后，上游照样拿到客户端手里的完整历史。
 	if historyTrimmed(full) {
-		if seeds := nt.seedTurns(r.cfg.Facade.PromptByteLimit()); len(seeds) > 0 {
+		if hs := nt.seedTurns(limit); len(hs) > 0 {
 			notice := ""
 			if !req.Bridge && r.cfg.Facade.PlatformNotice {
 				notice = platformNotice
 			}
-			plan.seeds, plan.fallback = append(skillSeeds, seeds...), full
-			items := nt.currentWithSystem(notice)
-			r.log.Info("原生续接：新建上游会话，历史分段补种后发送本轮", "key", nt.key, "cid", cid,
-				"skillParts", len(skillSeeds), "parts", len(seeds), "bytes", promptBytes(items))
-			return items
+			seeds, historyParts = append(seeds, hs...), len(hs)
+			items = nt.currentWithSystem(notice)
 		}
 	}
-	if len(skillSeeds) > 0 {
-		plan.seeds, plan.fallback = skillSeeds, full
-		r.log.Info("原生续接：新建上游会话，补种技能清单后发送全量", "key", nt.key, "cid", cid,
-			"skillParts", len(skillSeeds), "bytes", promptBytes(full))
-		return full
+	extra, items := splitOversize(items, limit)
+	seeds = append(seeds, extra...)
+	if len(seeds) > 0 {
+		plan.seeds, plan.fallback = seeds, full
 	}
-	r.log.Info("原生续接：新建上游会话，首轮发送全量", "key", nt.key, "cid", cid, "bytes", promptBytes(full))
-	return full
+	r.log.Info("原生续接：新建上游会话", "key", nt.key, "cid", cid, "skillParts", skillParts,
+		"historyParts", historyParts, "splitParts", len(extra), "bytes", promptBytes(items))
+	return items
 }
 
 // currentWithSystem 是 [完整 system, 本轮消息]（补种之后的那一轮用）。
@@ -675,7 +680,7 @@ func (nt *nativeTurn) release(drop bool, r *Runner) {
 // "Error while processing conversation (403)"），据此作废绑定会白白丢掉整段记忆。
 func isConversationGone(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, ErrPollTimeout) || errors.Is(err, ErrContextTooLarge) {
+		errors.Is(err, ErrPollTimeout) || errors.Is(err, ErrMessageTooLarge) {
 		return false
 	}
 	var ae *creds.APIError

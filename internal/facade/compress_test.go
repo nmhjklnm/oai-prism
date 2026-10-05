@@ -199,12 +199,18 @@ func TestCodexRequestKind(t *testing.T) {
 	}
 }
 
-func TestAnthropicTooLongMessage(t *testing.T) {
-	err := &contextTooLargeError{Bytes: 200000, Limit: 100000, Tokens: 50000}
-	if got := anthropicTooLongMessage(err); got != "prompt is too long: 50000 tokens > 25000 maximum" {
-		t.Fatalf("文案须与 Anthropic 官方一致: %q", got)
+// 单条放不下是 Prism 单条消息的上限，不是上下文窗口：Codex 拿到 invalid_prompt 只结束本轮，
+// 不像 context_length_exceeded 那样把窗口记成已满；Anthropic 文案不带 Claude Code 据以压缩的
+// "prompt is too long"。
+func TestMessageTooLargeError(t *testing.T) {
+	err := &messageTooLargeError{Bytes: 200000, Limit: 100000, Tokens: 50000}
+	if !strings.Contains(err.Error(), "200000 字节") || !strings.Contains(err.Error(), "不是上下文窗口") {
+		t.Fatalf("错误信息应说明是单条上限而不是窗口: %q", err.Error())
 	}
-	if !strings.Contains(err.Error(), "200000 字节") || responsesErrorCode(err) != "context_length_exceeded" {
-		t.Fatal("错误信息与 Responses 错误码不对")
+	if got := responsesErrorCode(err); got != "invalid_prompt" {
+		t.Fatalf("Responses 错误码应为 invalid_prompt，得到 %q", got)
+	}
+	if got := anthropicTooLargeMessage(err); strings.Contains(got, "prompt is too long") || !strings.Contains(got, "not the context window") {
+		t.Fatalf("Anthropic 文案不对: %q", got)
 	}
 }
