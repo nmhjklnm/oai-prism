@@ -335,3 +335,33 @@ func TestTurnAbortedStaysInTimeline(t *testing.T) {
 		t.Fatalf("打断说明应在原位: %s", timeline.String())
 	}
 }
+
+// 工具结果里的图片（view_image）随 [CLIENT RESULT] 交给上游，执行提醒接在文本块上而不是图片块上。
+func TestToolOutputImagesForwarded(t *testing.T) {
+	hist := `[{"type":"message","role":"user","content":[{"type":"input_text","text":"看图"}]},
+ {"type":"custom_tool_call","call_id":"c1","name":"exec","input":"await tools.view_image({path:'a.png'})"},
+ {"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]`
+	items := bridgeInputItems(json.RawMessage(hist), "", nil)
+	last := items[len(items)-1]
+	var img, txt int
+	for _, c := range last.Content {
+		switch c.Type {
+		case "input_image":
+			img++
+			if c.ImageURL != "data:image/png;base64,iVBORw0KGgo=" {
+				t.Fatalf("图片地址不对: %q", c.ImageURL)
+			}
+		default:
+			txt++
+			if !strings.Contains(c.Text, "Script completed") || !strings.HasSuffix(c.Text, localExecReminder) {
+				t.Fatalf("文本块应含结果并以执行提醒结尾: %q", c.Text)
+			}
+		}
+	}
+	if img != 1 || txt != 1 {
+		t.Fatalf("应有 1 个图片块和 1 个文本块: %+v", last.Content)
+	}
+	if conv := itemsConversation(items); conv == nil || strings.Contains(conv.currentText, "LOCAL_EXECUTION_REMINDER") {
+		t.Fatal("比对用的本轮文本不应带执行提醒")
+	}
+}

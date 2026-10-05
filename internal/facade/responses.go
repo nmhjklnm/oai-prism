@@ -169,7 +169,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
 		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()), turn.clientTools)
 		if input, skills = compactSkills(input, promptLimit); skills != "" {
-			h.log.Info("技能清单过大，移出 system，新建上游会话时单独补种", "bytes", len(skills))
+			h.log.Debug("技能清单过大，移出 system（新建上游会话时单独补种）", "bytes", len(skills))
 		}
 		native = itemsConversation(input)
 		if compaction {

@@ -217,6 +217,24 @@ func isUnforwardedDeveloper(text string) bool {
 		strings.HasPrefix(t, "<multi_agent_mode>")
 }
 
+// outputImages 取出工具结果里的图片块（input_image，data URI 或 URL）。
+func outputImages(r json.RawMessage) []prism.InputContent {
+	var parts []map[string]any
+	if len(r) == 0 || r[0] != '[' || json.Unmarshal(r, &parts) != nil {
+		return nil
+	}
+	var out []prism.InputContent
+	for _, p := range parts {
+		if t, _ := p["type"].(string); t != "input_image" && t != "image_url" && t != "image" {
+			continue
+		}
+		if url, detail := imageURLAndDetail(p); url != "" {
+			out = append(out, prism.InputContent{Type: "input_image", ImageURL: url, Detail: detail})
+		}
+	}
+	return out
+}
+
 // isTurnAbortedNotice 认出用户打断一轮后 Codex 插进历史的 <turn_aborted> developer 消息。
 //
 // 它说的是对话里某个时刻发生的事，不是常驻指令。当 developer 消息并进 system 时，
@@ -676,8 +694,12 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 				continue
 			}
 
-			items = append(items, prism.NewUserItem(
-				header+"\n"+out+"\n[/CLIENT RESULT]"))
+			result := prism.NewUserItem(header + "\n" + out + "\n[/CLIENT RESULT]")
+			// 工具结果里的图片（Codex 的 view_image 等）随这条消息交给上游 —— 和用户消息里的图片一样
+			// 由 runner 登记进项目（attachImages）。只取文字的话图片就丢了：2026-10-05 实测模型
+			// 调 view_image 拿回了图，却看不到，只好改用 OCR 识字。
+			result.Content = append(outputImages(b.Output), result.Content...)
+			items = append(items, result)
 		case "compaction_trigger":
 			// 远端压缩：触发条目不带提示词，由网关补上（见 compaction.go）。
 			items = append(items, prism.NewUserItem(compactionTriggerPrompt))
@@ -693,10 +715,15 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 	// 压缩请求（本地压缩与远端压缩的提示词都以这句开头）只要摘要，不接"必须发 codex-exec"。
 	for i := len(items) - 1; i >= 0; i-- {
 		if strings.EqualFold(items[i].Role, "user") && len(items[i].Content) > 0 {
-			lastText := items[i].Content[len(items[i].Content)-1].Text
+			// 接在最后一个文本块上：消息以图片结尾时，接到图片块上的文字发不出去。
+			k := len(items[i].Content) - 1
+			for k > 0 && items[i].Content[k].Type != prism.BlockInputText && items[i].Content[k].Type != "" {
+				k--
+			}
+			lastText := items[i].Content[k].Text
 			if !strings.Contains(lastText, "[LOCAL_EXECUTION_REMINDER]") &&
 				!strings.Contains(lastText, "CONTEXT CHECKPOINT COMPACTION") {
-				items[i].Content[len(items[i].Content)-1].Text += localExecReminder
+				items[i].Content[k].Text += localExecReminder
 			}
 			break
 		}
