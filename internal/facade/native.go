@@ -32,9 +32,11 @@ package facade
 //   - Codex 本地压缩后历史被替换成"若干条 user + 摘要"。摘要正是上游在这个会话里
 //     刚写的，认出它就把绑定对齐到压缩后的历史，继续用同一个上游会话（上游那边的
 //     完整记忆比摘要详细得多）。
-//   - system（桥指令约 13 KB）不每轮重发：上游会话里已有，重复只会挤占窗口。
-//     内容变了、或距上次完整发送累计超过 nativeSystemRefresh 字节时重发一次 ——
-//     上游自己管理长会话，离得太远的指令约束力会变弱，定期重发让它始终在近处。
+//   - system 不重发：上游会话里已有，重复只会挤占窗口（带上客户端的技能清单、工具目录，
+//     Codex 的 system 有几十 KB）。内容变了只发变了的那一段（systemUpdate），变动太大才
+//     整份重发。每轮本轮消息末尾另有一句执行提醒（localExecReminder），要紧的约定始终在近处。
+//   - 同一会话上一轮还没结束就来了新请求：客户端已经放弃了上一轮（用户打断、断线重发；
+//     停止信号不一定经中转站传到网关）。强键下先停掉上一轮再接着发增量，不另起会话整份重发。
 
 import (
 	"context"
@@ -57,8 +59,8 @@ const (
 	// nativeBindingTTL 是绑定的闲置寿命。上游会话本身不随沙箱回收而丢失（见 liveprobe），
 	// 绑定也落盘（native_store.go）：隔几天 resume 的 Codex 会话照样接回原来的上游会话。
 	nativeBindingTTL = 7 * 24 * time.Hour
-	// nativeSystemRefresh：距上次完整发送 system 累计发出这么多字节（增量正文）就重发一次。
-	nativeSystemRefresh = 48 << 10
+	// nativeSupersedeWait 是停掉上一轮后等它让出会话的最长时间（通知上游停止最多 5 秒）。
+	nativeSupersedeWait = 15 * time.Second
 	// nativeBriefSystem 是不重发完整 system 的轮次里代替它的一句话。
 	nativeBriefSystem = "(The instructions given earlier in this conversation remain in force.)"
 	// nativeSinceHeader 引出"上一轮回复之后客户端新增的其余条目"（并行工具结果等）。
@@ -110,6 +112,8 @@ type nativeTurn struct {
 	weak bool
 
 	plan *nativePlan // runner 在选定账号与项目后填写
+	// cancel 停掉本轮（runner.Run 设置）：持锁期间登记在绑定上，同一会话的下一个请求凭它停掉本轮。
+	cancel context.CancelFunc
 }
 
 // nativePlan 是本轮的执行方案，成功后由 commit 写回绑定。
@@ -119,7 +123,7 @@ type nativePlan struct {
 	continued bool           // true = 续接已有会话发增量；false = 新会话发全量
 	delivered []uint64
 	sysHash   uint64
-	sinceSys  int
+	system    string // 本轮之后上游会话里生效的 system 全文（下次算变化用）
 	// seeds 是新建会话后、本轮之前要先发的历史补种消息；fallback 是补种失败时改发的全量条目。
 	seeds    [][]prism.InputItem
 	fallback []prism.InputItem
@@ -136,16 +140,38 @@ type nativeBinding struct {
 	project   string
 	cid       string
 	delivered []uint64 // 上游会话已含的条目指纹（强键下不含助手条目）
-	sysHash   uint64   // 上次完整发送的 system 指纹
-	sinceSys  int      // 此后累计发出的增量字节
+	sysHash   uint64   // 上游会话里生效的 system 指纹
+	system    string   // 上游会话里生效的 system 全文（内容变了时只发变化，见 systemUpdate）
 	summary   string   // 最近一次 Codex 压缩请求里上游写的摘要
 	weak      bool     // 绑定建在弱键上：助手条目参与比对（凭句柄找回时也照此比）
 	updated   time.Time
+
+	// inflight 停掉正在跑的这一轮（持锁的那一轮登记，见 supersede）。
+	inflightMu sync.Mutex
+	inflight   context.CancelFunc
+}
+
+func (b *nativeBinding) setInflight(cancel context.CancelFunc) {
+	b.inflightMu.Lock()
+	b.inflight = cancel
+	b.inflightMu.Unlock()
+}
+
+// stopInflight 停掉正在跑的一轮；没有登记时返回 false。
+func (b *nativeBinding) stopInflight() bool {
+	b.inflightMu.Lock()
+	cancel := b.inflight
+	b.inflightMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
 }
 
 func (b *nativeBinding) reset() {
 	b.account, b.project, b.cid, b.summary = "", "", "", ""
-	b.delivered, b.sysHash, b.sinceSys = nil, 0, 0
+	b.delivered, b.sysHash, b.system = nil, 0, ""
 }
 
 var nativeBindings = struct {
@@ -244,6 +270,11 @@ func (nt *nativeTurn) delta(b *nativeBinding, es []historyEntry) ([]historyEntry
 	if !nt.strong {
 		return nil, false
 	}
+	// 整段历史上游都已收到：同一轮上次发出后被中途停掉（打断、断线重发），上游有这条消息、
+	// 没有完整回答。在原会话里重发本轮消息，不另起会话整份重发。
+	if j == len(b.delivered) && j > 0 && i == len(es) {
+		return es[len(es)-1:], true
+	}
 	// 2) 只发本轮消息的客户端（显式会话键、不带历史）：直接追加。
 	if len(nt.conv.history) == 0 {
 		return es, true
@@ -263,24 +294,25 @@ func (nt *nativeTurn) delta(b *nativeBinding, es []historyEntry) ([]historyEntry
 	return nil, false
 }
 
-// deltaItems 把增量组装成上游要的 [system, user]，并返回提交时写回的 system 状态。
+// deltaItems 把增量组装成上游要的 [system, user]，并返回 system 指纹与这轮 system 的发法
+// （brief：一句话代替；update：只发变了的部分；full：整份重发）。
 // limit 是单条提示词字节上限（0 不限），notice 非空时随完整 system 前置。
-func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit int, notice string) ([]prism.InputItem, uint64, int) {
+func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit int, notice string) ([]prism.InputItem, uint64, string) {
 	conv := nt.conv
 	cur := conv.current
 	cur.Content = append([]prism.InputContent(nil), cur.Content...)
 	curText := itemText(cur)
 
 	sysHash := textFingerprint(conv.system)
-	system := nativeBriefSystem
-	full := sysHash != b.sysHash
-	if !full && b.sinceSys+len(curText) > nativeSystemRefresh {
-		full = true
-	}
-	if full {
-		system = conv.system
-		if notice != "" {
-			system = notice + "\n\n" + system
+	system, mode := nativeBriefSystem, "brief"
+	if sysHash != b.sysHash {
+		if upd, ok := systemUpdate(b.system, conv.system); ok {
+			system, mode = upd, "update"
+		} else {
+			system, mode = conv.system, "full"
+			if notice != "" {
+				system = notice + "\n\n" + system
+			}
 		}
 	}
 	if conv.extra != "" {
@@ -289,12 +321,10 @@ func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit in
 
 	// 本轮消息之前的新条目（并行工具结果、客户端插入的消息）放在本轮消息前面，
 	// 超出单条上限时按折叠历史的规则裁剪（compress.go）。
-	added := 0
 	if prior := rest[:len(rest)-1]; len(prior) > 0 {
 		budget := historyBudget(limit, len(system)+len(curText)+len(nativeSinceHeader))
 		if h := strings.TrimPrefix(renderHistory(prior, budget), historyHeader); h != "" {
 			prefix := nativeSinceHeader + h + "\n\n"
-			added = len(prefix)
 			if len(cur.Content) > 0 && (cur.Content[0].Type == "" || cur.Content[0].Type == prism.BlockInputText) {
 				cur.Content[0].Text = prefix + cur.Content[0].Text
 			} else {
@@ -302,12 +332,7 @@ func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit in
 			}
 		}
 	}
-
-	since := b.sinceSys + len(curText) + added
-	if full {
-		since = len(curText) + added
-	}
-	return []prism.InputItem{prism.NewSystemItem(system), cur}, sysHash, since
+	return []prism.InputItem{prism.NewSystemItem(system), cur}, sysHash, mode
 }
 
 // itemText 拼出条目里全部文本块。
@@ -429,11 +454,12 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 		return full // 会话挂在项目下：没有项目只能单条全量
 	}
 	b := nativeBindingFor(nt.key)
-	if !b.mu.TryLock() {
-		// 同一会话上一轮还没结束（并发请求）：这一轮发单条全量、不带会话 ID，不碰绑定。
+	if !b.mu.TryLock() && !(nt.strong && r.supersede(ctx, b, nt.key)) {
+		// 停不掉上一轮（弱键会撞键，不敢停别人的）：这一轮发单条全量、不带会话 ID，不碰绑定。
 		r.log.Info("原生续接：会话正忙，本轮按全量发送", "key", nt.key)
 		return full
 	}
+	b.setInflight(nt.cancel)
 	plan := nt.plan
 	plan.b = b
 	es := nt.conv.entries()
@@ -447,15 +473,15 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 			if !req.Bridge && r.cfg.Facade.PlatformNotice {
 				notice = platformNotice
 			}
-			items, sysHash, since := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
-			plan.cid, plan.continued, plan.sysHash, plan.sinceSys = b.cid, true, sysHash, since
+			items, sysHash, sysMode := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
+			plan.cid, plan.continued, plan.sysHash, plan.system = b.cid, true, sysHash, nt.conv.system
 			// 增量本身放不下（本轮贴了大段内容、工具结果很长）：前面几段先补种进同一个会话。
 			// 补种失败没有可退的全量（会话里已有历史），fallback 留空，由 runOnce 直接报错。
 			if seeds, split := splitOversize(items, r.cfg.Facade.PromptByteLimit()); len(seeds) > 0 {
 				plan.seeds, items = seeds, split
 			}
 			r.log.Info("原生续接：发送增量", "key", nt.key, "cid", b.cid, "newEntries", len(rest),
-				"seedParts", len(plan.seeds), "bytes", promptBytes(items), "fullSystem", textOfSystem(items) != nativeBriefSystem)
+				"seedParts", len(plan.seeds), "bytes", promptBytes(items), "system", sysMode)
 			return items
 		}
 		r.log.Info("原生续接：客户端历史与上游会话对不上，新建会话", "key", nt.key, "oldCid", b.cid)
@@ -470,8 +496,7 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 	}
 	r.app.ConversationOps.Inc("create", "ok")
 	plan.cid = cid
-	plan.sysHash = textFingerprint(nt.conv.system)
-	plan.sinceSys = len(itemText(nt.conv.current))
+	plan.sysHash, plan.system = textFingerprint(nt.conv.system), nt.conv.system
 
 	// 新会话里要先补种的：移出 system 的完整技能清单（见 skills.go）、一条放不下的历史，
 	// 最后是本轮仍放不下时拆出的前几段（见 split.go）。补种失败就改发 full（裁剪后的全量）。
@@ -499,6 +524,47 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 	r.log.Info("原生续接：新建上游会话", "key", nt.key, "cid", cid, "skillParts", skillParts,
 		"historyParts", historyParts, "splitParts", len(extra), "bytes", promptBytes(items))
 	return items
+}
+
+// supersede 停掉同一会话正在跑的上一轮，等它让出会话；拿到锁返回 true。
+//
+// 同一会话的请求是一问一答：上一轮没结束就来了新请求，说明客户端已经放弃了上一轮
+// （用户打断、断线重发）。停止信号不一定传得到网关 —— 2026-10-05 实测经中转站时，
+// 用户打断后那一轮在上游又跑了 10 秒、照样计费，新消息只能另起会话整份重发。
+func (r *Runner) supersede(ctx context.Context, b *nativeBinding, key string) bool {
+	if b.stopInflight() {
+		r.log.Info("原生续接：同一会话来了新请求，停掉上一轮", "key", key)
+	}
+	deadline := time.Now().Add(nativeSupersedeWait)
+	for {
+		if b.mu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) || sleepCtx(ctx, 100*time.Millisecond) != nil {
+			return false
+		}
+	}
+}
+
+// awaitSession 在选号之前等会话空出来：上一轮还占着就先停掉它。
+//
+// 必须在选号之前：上一轮还占着会话绑定的号的并发槽，粘性选号会一直等那个槽；而且
+// handler 挂续接时会话正忙、没拿到绑定的项目与号（见 attachNative），这里补上 ——
+// 否则这一轮可能落到别的号上，只能新建会话整份重发。
+func (r *Runner) awaitSession(ctx context.Context, nt *nativeTurn, req *RunRequest) {
+	b := nativeBindingPeek(nt.key)
+	if b == nil || (!b.mu.TryLock() && !r.supersede(ctx, b, nt.key)) {
+		return
+	}
+	project, account := b.project, b.account
+	b.mu.Unlock()
+	if req.ProjectID == "" && project != "" {
+		req.ProjectID = project
+		req.MarkProjectFromChain()
+		if req.BoundAccountID == "" {
+			req.BoundAccountID = account
+		}
+	}
 }
 
 // currentWithSystem 是 [完整 system, 本轮消息]（补种之后的那一轮用）。
@@ -627,13 +693,16 @@ func (r *Runner) createConversation(ctx context.Context, p prism.Principal, proj
 }
 
 // commit 把成功的一轮写回绑定（并落盘）后解锁。r 为 nil 时不落盘。
-func (nt *nativeTurn) commit(res *RunResult, r *Runner) {
+// complete=false 是发出后被中途停掉的一轮（见 runner.Run）：上游已收到本轮内容、没有完整
+// 回答，只记送达的条目。
+func (nt *nativeTurn) commit(res *RunResult, r *Runner, complete bool) {
 	plan := nt.plan
 	if plan == nil || plan.b == nil {
 		return
 	}
 	b := plan.b
 	plan.b = nil
+	b.setInflight(nil)
 	defer b.mu.Unlock()
 	defer r.persistNative(b)
 	if plan.cid == "" || res == nil {
@@ -643,7 +712,7 @@ func (nt *nativeTurn) commit(res *RunResult, r *Runner) {
 	newConv := b.cid != plan.cid
 	b.account, b.project, b.cid, b.weak = res.AccountID, res.ProjectID, plan.cid, nt.weakMatch()
 	b.delivered = plan.delivered
-	if nt.weakMatch() {
+	if nt.weakMatch() && complete {
 		b.delivered = append(b.delivered, entryFingerprint(historyEntry{speaker: "Assistant", text: res.Text}))
 	}
 	if newConv {
@@ -652,8 +721,8 @@ func (nt *nativeTurn) commit(res *RunResult, r *Runner) {
 		b.addAliasLocked(nativeConvKey(nt.key, plan.cid))
 		nativeBindings.mu.Unlock()
 	}
-	b.sysHash, b.sinceSys = plan.sysHash, plan.sinceSys
-	if nt.compaction {
+	b.sysHash, b.system = plan.sysHash, plan.system
+	if nt.compaction && complete {
 		b.summary = strings.TrimSpace(res.Text)
 	}
 	b.updated = time.Now()
@@ -667,6 +736,7 @@ func (nt *nativeTurn) release(drop bool, r *Runner) {
 	}
 	b := plan.b
 	plan.b = nil
+	b.setInflight(nil)
 	if drop {
 		b.reset()
 		r.persistNative(b)

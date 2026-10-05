@@ -247,6 +247,17 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		emitted bool
 	)
 
+	// 原生续接：同一会话的下一个请求可以停掉这一轮（见 supersede）。
+	if nt := req.Native; nt != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		nt.cancel = cancel
+		if nt.strong {
+			r.awaitSession(ctx, nt, req)
+		}
+	}
+
 	for attempt := 0; attempt < r.accountRetries; attempt++ {
 		lease, err := r.acquire(ctx, req)
 		if err != nil {
@@ -264,7 +275,11 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 
 		if nt := req.Native; nt != nil {
 			if err == nil {
-				nt.commit(res, r)
+				nt.commit(res, r, true)
+			} else if res != nil && res.RequestID != "" && nt.strong && errors.Is(err, context.Canceled) {
+				// 发出后被停掉（客户端断开、同一会话来了新请求）：上游已收到本轮内容，记为已送达，
+				// 下一轮只发之后的新条目，不把这一轮的内容再发一遍。
+				nt.commit(res, r, false)
 			} else {
 				// 续接的上游会话已不可用（被删、超出上游会话上限等）：作废绑定，
 				// 还没吐出内容就用新会话 + 全量上下文原地重来一次。

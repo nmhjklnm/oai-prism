@@ -3,9 +3,11 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/oai-prism/oaiprism/internal/config"
 )
@@ -242,4 +244,107 @@ func TestE2E_Native_CompactionKeepsConversation(t *testing.T) {
 	if startConv(t, up, 2) != cid || !strings.HasPrefix(user, "继续：写 out.txt") {
 		t.Fatalf("压缩后应接着用同一个会话、只发新消息: cid=%q user=%.120q", startConv(t, up, 2), user)
 	}
+}
+
+// 同一会话上一轮还没结束就来了新请求（用户打断后接着说、断线重发）：停掉上一轮，
+// 在原上游会话里接着发增量，不另起会话整份重发；被停掉那一轮已送达的内容不再重发。
+func TestE2E_Native_NewRequestSupersedesRunningTurn(t *testing.T) {
+	up := &fakeUpstream{t: t, stallFirst: 100000}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+	hdr := map[string]string{"Content-Type": "application/json", "X-Oaiprism-Session": "codex-supersede-1"}
+	turn1 := []any{
+		codexMsg("developer", "<permissions instructions>workspace-write</permissions instructions>"),
+		codexMsg("user", "第一问：FIRST-QUESTION"),
+	}
+	done := postAsync(ts.URL+"/v1/responses", codexBody(t, "turn", turn1...), hdr)
+	waitFor(t, func() bool {
+		up.mu.Lock()
+		defer up.mu.Unlock()
+		return len(up.statusBodies) > 0
+	})
+
+	turn2 := append(append([]any{}, turn1...),
+		codexMsg("developer", "<turn_aborted>\nThe previous turn was interrupted on purpose.\n</turn_aborted>"),
+		codexMsg("user", "第二问：SECOND-QUESTION"))
+	if code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses", codexBody(t, "turn", turn2...), hdr); code != http.StatusOK {
+		t.Fatalf("状态码 %d: %.300s", code, out)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("上一轮应被停掉")
+	}
+	up.mu.Lock()
+	stops := len(up.stopBodies)
+	up.mu.Unlock()
+	if stops == 0 {
+		t.Fatal("应通知上游停止上一轮")
+	}
+	if a, b := startConv(t, up, 0), startConv(t, up, 1); a == "" || a != b {
+		t.Fatalf("第二轮应续接同一个上游会话: %q vs %q", a, b)
+	}
+	sys, user := requireSystemUser(t, upstreamInput(t, up, 1))
+	if strings.Contains(sys, "workspace-write") || strings.Contains(user, "FIRST-QUESTION") ||
+		!strings.Contains(user, "SECOND-QUESTION") || !strings.Contains(user, "interrupted") {
+		t.Fatalf("第二轮应只发打断说明与新消息: sys=%.120q user=%q", sys, user)
+	}
+}
+
+// 同一轮原样重发（断线重连）：停掉上一次，在原会话里只重发本轮消息。
+func TestE2E_Native_IdenticalRetryResendsOnlyCurrent(t *testing.T) {
+	up := &fakeUpstream{t: t, stallFirst: 100000}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+	hdr := map[string]string{"Content-Type": "application/json", "X-Oaiprism-Session": "codex-supersede-2"}
+	turn := []any{
+		codexMsg("developer", "<permissions instructions>workspace-write</permissions instructions>"),
+		codexMsg("user", "只有一问：ONLY-QUESTION"),
+	}
+	postAsync(ts.URL+"/v1/responses", codexBody(t, "turn", turn...), hdr)
+	waitFor(t, func() bool {
+		up.mu.Lock()
+		defer up.mu.Unlock()
+		return len(up.statusBodies) > 0
+	})
+	if code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses", codexBody(t, "turn", turn...), hdr); code != http.StatusOK {
+		t.Fatalf("状态码 %d: %.300s", code, out)
+	}
+	if a, b := startConv(t, up, 0), startConv(t, up, 1); a == "" || a != b {
+		t.Fatalf("重发应续接同一个上游会话: %q vs %q", a, b)
+	}
+	sys, user := requireSystemUser(t, upstreamInput(t, up, 1))
+	if strings.Contains(sys, "workspace-write") || !strings.HasPrefix(user, "只有一问：ONLY-QUESTION") {
+		t.Fatalf("重发应只带本轮消息: sys=%.120q user=%q", sys, user)
+	}
+}
+
+// waitFor 轮询等条件成立（最多 10 秒）。
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("等待超时")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// postAsync 在后台发请求（不碰 *testing.T），请求结束时关闭返回的通道。
+func postAsync(url, body string, hdr map[string]string) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		if err != nil {
+			return
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	return done
 }

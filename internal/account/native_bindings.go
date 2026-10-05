@@ -17,7 +17,7 @@ type NativeBindingRecord struct {
 	CID       string    `json:"cid"`
 	Delivered []byte    `json:"delivered,omitempty"` // 已送达条目的指纹（小端 uint64 序列）
 	SysHash   uint64    `json:"sys_hash,omitempty"`
-	SinceSys  int       `json:"since_sys,omitempty"`
+	System    string    `json:"system,omitempty"` // 上游会话里生效的 system 全文
 	Summary   string    `json:"summary,omitempty"`
 	Weak      bool      `json:"weak,omitempty"`
 	Updated   time.Time `json:"-"`

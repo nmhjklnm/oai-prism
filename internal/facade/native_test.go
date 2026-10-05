@@ -22,7 +22,7 @@ func committed(nt *nativeTurn, reply string) *nativeBinding {
 	b := &nativeBinding{cid: "cdx1_x", account: "a", project: "p"}
 	b.mu.Lock()
 	nt.plan = &nativePlan{b: b, cid: "cdx1_x", delivered: nt.fingerprints(nt.conv.entries()), sysHash: textFingerprint(nt.conv.system)}
-	nt.commit(&RunResult{AccountID: "a", ProjectID: "p", Text: reply}, nil)
+	nt.commit(&RunResult{AccountID: "a", ProjectID: "p", Text: reply}, nil, true)
 	return b
 }
 
@@ -111,36 +111,65 @@ func TestNativeDelta_RebaseOnCompactionSummary(t *testing.T) {
 	}
 }
 
-// system 不每轮重发：未变时用一句话代替；变了、或累计增量超过阈值时重发完整内容。
-func TestNativeDeltaItems_SystemRefresh(t *testing.T) {
-	sys := strings.Repeat("bridge rules ", 1000)
+// system 不重发：未变时用一句话代替；变了只发变化的那一段；没有旧文本或变动太大才整份重发。
+func TestNativeDeltaItems_SystemResend(t *testing.T) {
+	sys := "BRIDGE RULES\n" + strings.Repeat("bridge rules line\n", 1000) + "<env>cwd=/a</env>\nTAIL"
 	nt := &nativeTurn{strong: true, conv: nativeConv(sys, "[CLIENT RESULT] ok")}
-	b := &nativeBinding{sysHash: textFingerprint(sys), sinceSys: 100}
+	b := &nativeBinding{sysHash: textFingerprint(sys), system: sys}
 	rest := nt.conv.entries()
 
-	items, _, since := nt.deltaItems(b, rest, 96<<10, "")
-	if got := itemText(items[0]); got != nativeBriefSystem {
-		t.Fatalf("system 未变时不应重发: %.60q", got)
+	items, _, mode := nt.deltaItems(b, rest, 96<<10, "")
+	if got := itemText(items[0]); got != nativeBriefSystem || mode != "brief" {
+		t.Fatalf("system 未变时不应重发: %s %.60q", mode, got)
 	}
-	if since != 100+len("[CLIENT RESULT] ok") || itemText(items[1]) != "[CLIENT RESULT] ok" {
-		t.Fatalf("累计字节或本轮消息不对: since=%d %q", since, itemText(items[1]))
-	}
-
-	b.sinceSys = nativeSystemRefresh
-	items, _, since = nt.deltaItems(b, rest, 96<<10, "NOTICE")
-	if got := itemText(items[0]); !strings.HasPrefix(got, "NOTICE\n\n") || !strings.Contains(got, sys) {
-		t.Fatal("超过阈值应重发完整 system（连同平台声明）")
-	}
-	if since != len("[CLIENT RESULT] ok") {
-		t.Fatalf("重发后累计应清零重算: %d", since)
+	if itemText(items[1]) != "[CLIENT RESULT] ok" {
+		t.Fatalf("本轮消息不对: %q", itemText(items[1]))
 	}
 
-	nt.conv.system = "changed"
+	// 只改了一行：只发这一行，带位置和旧内容。
+	nt.conv.system = strings.Replace(sys, "cwd=/a", "cwd=/b", 1)
 	nt.conv.extra = "<context_checkpoint>x</context_checkpoint>"
-	b.sinceSys = 0
-	items, h, _ := nt.deltaItems(b, rest, 96<<10, "")
-	if got := itemText(items[0]); got != "changed\n\n"+nt.conv.extra || h != textFingerprint("changed") {
-		t.Fatalf("system 变了应重发，附加指令每轮照发且不计入指纹: %q", got)
+	items, h, mode := nt.deltaItems(b, rest, 96<<10, "NOTICE")
+	got := itemText(items[0])
+	if mode != "update" || h != textFingerprint(nt.conv.system) || len(got) > 1000 ||
+		!strings.Contains(got, "cwd=/b") || !strings.Contains(got, "cwd=/a") || !strings.Contains(got, `"bridge rules line"`) ||
+		!strings.HasSuffix(got, "\n\n"+nt.conv.extra) || strings.Contains(got, "NOTICE") {
+		t.Fatalf("小改动应只发变化（附加指令照发）: %s %q", mode, got)
+	}
+
+	// 没有旧文本（旧版落盘的绑定）：整份重发，连同平台声明。
+	b.system = ""
+	items, _, mode = nt.deltaItems(b, rest, 96<<10, "NOTICE")
+	if got := itemText(items[0]); mode != "full" || !strings.HasPrefix(got, "NOTICE\n\n") || !strings.Contains(got, "cwd=/b") {
+		t.Fatalf("没有旧文本应整份重发: %s", mode)
+	}
+
+	// 改了大半：整份重发。
+	b.system = sys
+	nt.conv.system = "totally different"
+	if _, _, mode = nt.deltaItems(b, rest, 96<<10, ""); mode != "full" {
+		t.Fatalf("变动太大应整份重发: %s", mode)
+	}
+}
+
+// systemUpdate：删除、开头、结尾的变化都给出位置；旧内容太长时不照抄。
+func TestSystemUpdate(t *testing.T) {
+	base := "A\n" + strings.Repeat("keep\n", 500) + "Z"
+	if _, ok := systemUpdate(base, base); ok {
+		t.Fatal("没有变化不应给更新")
+	}
+	upd, ok := systemUpdate(base, strings.Replace(base, "A\n", "", 1))
+	if !ok || !strings.Contains(upd, "removed") || !strings.Contains(upd, "<<<\nA\n>>>") {
+		t.Fatalf("删除开头一行: %q", upd)
+	}
+	upd, ok = systemUpdate(base, base+"\nNEW")
+	if !ok || !strings.Contains(upd, `after the line starting "Z"`) || !strings.Contains(upd, "NEW") {
+		t.Fatalf("末尾追加: %q", upd)
+	}
+	long := strings.Repeat("x", 3000)
+	upd, ok = systemUpdate(base+"\n"+long+"\n"+strings.Repeat("tail\n", 2000), base+"\nshort\n"+strings.Repeat("tail\n", 2000))
+	if !ok || strings.Contains(upd, long) || !strings.Contains(upd, "void") || !strings.Contains(upd, "short") {
+		t.Fatalf("旧内容太长时只给位置: %.300q", upd)
 	}
 }
 
@@ -181,7 +210,7 @@ func TestNativeCommitAndRelease(t *testing.T) {
 	b.cid = "old"
 	b.mu.Lock()
 	nt.plan = &nativePlan{b: b}
-	nt.commit(&RunResult{Text: "x"}, nil)
+	nt.commit(&RunResult{Text: "x"}, nil, true)
 	if b.cid != "" || !b.mu.TryLock() {
 		t.Fatal("无状态轮次应清空绑定并解锁")
 	}
@@ -314,7 +343,7 @@ func TestNativeCommit_RegistersAliases(t *testing.T) {
 	b.mu.Lock()
 	nt := &nativeTurn{key: key, conv: nativeConv("", "hi")}
 	nt.plan = &nativePlan{b: b, cid: "cdx1_alias", delivered: nt.fingerprints(nt.conv.entries())}
-	nt.commit(&RunResult{AccountID: "a", ProjectID: "p", Text: "yo"}, nil)
+	nt.commit(&RunResult{AccountID: "a", ProjectID: "p", Text: "yo"}, nil, true)
 
 	if got := nativeBindingPeek("k:feedfacefeedface|cid:cdx1_alias"); got != b {
 		t.Fatal("回传的会话 ID 应能找回绑定")
@@ -369,8 +398,8 @@ func TestNativeStore_SurvivesRestart(t *testing.T) {
 	b := nativeBindingFor(key)
 	b.mu.Lock()
 	nt := &nativeTurn{key: key, strong: true, conv: nativeConv("SYS", "记住 PERSIST-9")}
-	nt.plan = &nativePlan{b: b, cid: "cdx1_persist", delivered: nt.fingerprints(nt.conv.entries()), sysHash: textFingerprint("SYS"), sinceSys: 42}
-	nt.commit(&RunResult{AccountID: "acct", ProjectID: "proj", Text: "好"}, r)
+	nt.plan = &nativePlan{b: b, cid: "cdx1_persist", delivered: nt.fingerprints(nt.conv.entries()), sysHash: textFingerprint("SYS"), system: "SYS"}
+	nt.commit(&RunResult{AccountID: "acct", ProjectID: "proj", Text: "好"}, r, true)
 	r.AliasNative("k:0badc0de0badc0de|r:resp_p", key)
 	if rec, ok := st.recs[key]; !ok || rec.CID != "cdx1_persist" || len(rec.Aliases) != 2 {
 		t.Fatalf("提交后应落盘（含会话 ID 与会话链两个别名）: %+v", st.recs[key])
@@ -384,7 +413,7 @@ func TestNativeStore_SurvivesRestart(t *testing.T) {
 	nativeBindings.mu.Unlock()
 	r.UseNativeStore(st)
 	got := nativeBindingPeek(key)
-	if got == nil || got.cid != "cdx1_persist" || got.account != "acct" || got.project != "proj" || got.sinceSys != 42 ||
+	if got == nil || got.cid != "cdx1_persist" || got.account != "acct" || got.project != "proj" || got.system != "SYS" ||
 		len(got.delivered) != 1 || got.delivered[0] != entryFingerprint(historyEntry{"User", "记住 PERSIST-9"}) {
 		t.Fatalf("重启后应恢复绑定: %+v", got)
 	}

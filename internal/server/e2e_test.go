@@ -86,6 +86,9 @@ type fakeUpstream struct {
 	// replyParts 覆盖默认的逐字生成内容（见 parts）。
 	replyParts []string
 
+	// stallFirst 让第一个生成请求（req-1）先空转这么多次轮询再出字：模拟还在思考的长轮次。
+	stallFirst int
+
 	// 会话登记（Server Action createProjectConversation）：convs 是登记过的会话 ID，
 	// actionFails 让登记失败，goneConvs 里的会话在 start 时回 conversation_too_large。
 	convs       map[string]bool
@@ -397,10 +400,21 @@ func (f *fakeUpstream) handler() http.Handler {
 		}
 		st.polls++
 		n := st.polls
+		if rid == "req-1" && f.stallFirst > 0 && n <= f.stallFirst {
+			st.seq = n + 1
+			f.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending", "request_id": rid, "turn_state": map[string]any{"seq": n + 1}})
+			return
+		}
+		progress := n
+		if rid == "req-1" && f.stallFirst > 0 {
+			progress -= f.stallFirst
+		}
 		f.mu.Unlock()
 
 		parts := f.parts()
-		upto := n
+		upto := progress
 		if upto > len(parts) {
 			upto = len(parts)
 		}

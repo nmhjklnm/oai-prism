@@ -60,7 +60,7 @@ func bindingFromRecord(rec account.NativeBindingRecord) *nativeBinding {
 	return &nativeBinding{
 		key: rec.Key, aliases: rec.Aliases,
 		account: rec.Account, project: rec.Project, cid: rec.CID,
-		delivered: delivered, sysHash: rec.SysHash, sinceSys: rec.SinceSys,
+		delivered: delivered, sysHash: rec.SysHash, system: rec.System,
 		summary: rec.Summary, weak: rec.Weak, updated: rec.Updated,
 	}
 }
@@ -77,7 +77,7 @@ func (b *nativeBinding) record() account.NativeBindingRecord {
 	return account.NativeBindingRecord{
 		Key: b.key, Aliases: aliases,
 		Account: b.account, Project: b.project, CID: b.cid,
-		Delivered: delivered, SysHash: b.sysHash, SinceSys: b.sinceSys,
+		Delivered: delivered, SysHash: b.sysHash, System: b.system,
 		Summary: b.summary, Weak: b.weak, Updated: b.updated,
 	}
 }
