@@ -19,8 +19,13 @@ import (
 // 的是「账号的沙箱保活」（多号 TTFB 择优），这里预热的是「项目」——
 // 项目按会话创建、不可跨会话复用，只有提前建好等新会话来领才有意义。
 
-// warmEntryTTL 是预热条目的保鲜期。资源令牌实测 1 小时有效、沙箱闲置约
-// 25 分钟被回收：取 40 分钟 —— 过期条目直接丢弃重建，比"续命"简单可靠。
+// warmEntryTTL 是预热条目里"沙箱同步"的保鲜期。资源令牌实测 1 小时有效、沙箱闲置约
+// 25 分钟被回收：取 40 分钟。过期的只是同步状态，项目本身一直可用 —— 条目保留、标为
+// 未同步，领走它的会话在正常路径里重做同步。
+//
+// 以前过期就丢弃重建：空闲时每 40 分钟每个号新建 2 个项目，用不上的就扔在账号里。
+// 2026-10-05 实测本机网关 6 小时建了 39 个、只领走 3 个；上游没有删项目的接口可用，
+// 扔掉的项目永久留在账号的项目列表里。
 const warmEntryTTL = 40 * time.Minute
 
 // warmCreateGap 是同账号两次预热创建之间的间隔：预热不该跟 Sentinel 风控
@@ -160,16 +165,15 @@ func (w *warmPool) gcAccount(accountID string, now time.Time) {
 	w.gcAccountLocked(accountID, now)
 }
 
+// gcAccountLocked 把同步已过期的条目标为未同步（项目保留，见 warmEntryTTL）。
 func (w *warmPool) gcAccountLocked(accountID string, now time.Time) []warmEntry {
 	es := w.byAccount[accountID]
-	kept := es[:0]
-	for _, e := range es {
-		if now.Sub(e.warmedAt) < warmEntryTTL {
-			kept = append(kept, e)
+	for i := range es {
+		if es[i].synced && now.Sub(es[i].warmedAt) >= warmEntryTTL {
+			es[i].synced = false
 		}
 	}
-	w.byAccount[accountID] = kept
-	return kept
+	return es
 }
 
 // warmLoop 是预热池的后台循环：周期巡检 + 领走后的补充信号。
