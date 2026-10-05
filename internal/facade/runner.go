@@ -683,15 +683,16 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 按 transcript 行号去重。不算首字（指标衡量的是正文首字延迟）。
 	seenSummary := map[int]bool{}
 	emitLiveReasoning := func(st *prism.StatusResponse) error {
-		if emit == nil {
-			return nil
-		}
 		for _, sm := range st.LiveReasoning {
 			text := strings.TrimSpace(sm.Text)
 			if text == "" || seenSummary[sm.LineIndex] {
 				continue
 			}
 			seenSummary[sm.LineIndex] = true
+			rate.observeReasoning()
+			if emit == nil {
+				continue
+			}
 			if err := emit(Delta{Reasoning: text}); err != nil {
 				return err
 			}
