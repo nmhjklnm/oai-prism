@@ -47,6 +47,30 @@
 
 <br>
 
+## 这个 fork 改了什么
+
+本仓库 fork 自 [alanbulan/oai-prism](https://github.com/alanbulan/oai-prism)，改动都在 `bridge-mcp-warm` 分支，
+主要面向「本地 Codex CLI 多开会话」的使用方式：
+
+```bash
+git clone -b bridge-mcp-warm https://github.com/nmhjklnm/oai-prism.git
+```
+
+| 改动 | 效果 | 配置 |
+|---|---|---|
+| MCP 等客户端工具透传 | Codex 里配的 MCP 工具，上游模型也能调用 | — |
+| 放行申请 | 需要联网等越过本地沙箱的命令，Codex 会弹窗问你批不批 | — |
+| 思考过程半流式 | 生成途中把上游的思考摘要实时推给 Codex，不必干等最终答案 | — |
+| 联网搜索展示 | 答案带引用时补上「搜索了什么、打开了哪些页面」的条目 | — |
+| 远端压缩映射 | Codex 的 provider 名叫 `OpenAI` 时压缩也能完成，不再整轮报错 | — |
+| 新会话预热 | 每个账号常备建好的项目，新会话首轮更快 | `facade.project_warm_pool` |
+| 满员排队 | 全部账号满并发时新请求先来先到排队，而不是立即报错 | `pool.queue_wait` |
+| 新会话平均分号 | 按各账号已绑定的会话数分配；网关重启后老会话认回原账号 | — |
+| 同号错开发起 | 同一账号相邻两次发起至少隔几秒，避免同一瞬间发起被上游拒绝 | `facade.start_gap` |
+| 提前签好 Sentinel 令牌 | 后台先签好备用，请求来了直接拿，省掉每次签名的等待 | `upstream.sentinel_presign` |
+
+细节与实测数据见[架构与原理](docs/架构与原理.md)。
+
 ## 为什么是 OAIprism
 
 Prism（`prism.openai.com`）背后是强大的推理模型，但它说的是一套私有协议：
@@ -129,6 +153,9 @@ requires_openai_auth = false
 base_url = "http://127.0.0.1:8787/v1"
 experimental_bearer_token = "<你的 Key>"
 ```
+
+provider 名叫 `OpenAI` 的配置（比如沿用官方中转的那份，只改 `base_url`）同样能用：
+这时 Codex 的上下文压缩改走远端压缩，网关也能处理。
 
 <details>
 <summary><b>OpenAI SDK</b></summary>
