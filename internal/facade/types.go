@@ -172,7 +172,7 @@ type ChatUsage struct {
 	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
-// PromptTokensDetails 与 OpenAI 同名结构对齐。网关不做提示缓存，cached_tokens 恒为 0。
+// PromptTokensDetails 与 OpenAI 同名结构对齐。cached_tokens 是上游会话里已有、本轮没重发的部分（见 runner）。
 type PromptTokensDetails struct {
 	CachedTokens int `json:"cached_tokens"`
 }
@@ -234,8 +234,9 @@ type AnthropicContent struct {
 
 // AnthropicUsage 是用量。
 type AnthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens          int `json:"input_tokens"` // 不含缓存读取（Anthropic 口径）
+	OutputTokens         int `json:"output_tokens"`
+	CacheReadInputTokens int `json:"cache_read_input_tokens"`
 }
 
 // ---------------------------- OpenAI Responses ----------------------------

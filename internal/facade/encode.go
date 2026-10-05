@@ -99,7 +99,9 @@ func AppendChatChunk(dst []byte, s ChatChunkSpec) []byte {
 		dst = sse.AppendInt(dst, int64(s.Usage.OutputTokens))
 		dst = append(dst, `,"total_tokens":`...)
 		dst = sse.AppendInt(dst, int64(s.Usage.TotalTokens))
-		dst = append(dst, `,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":`...)
+		dst = append(dst, `,"prompt_tokens_details":{"cached_tokens":`...)
+		dst = sse.AppendInt(dst, int64(s.Usage.CachedInputTokens))
+		dst = append(dst, `},"completion_tokens_details":{"reasoning_tokens":`...)
 		dst = sse.AppendInt(dst, int64(s.Usage.ReasoningTokens))
 		dst = append(dst, `}}`...)
 	}
@@ -170,12 +172,15 @@ func AppendAnthropicEvent(dst []byte, e AnthropicEvent) []byte {
 			dst = append(dst, `null`...)
 		}
 		// 新版 Anthropic API 在 message_delta 里给出完整用量（累计值）
-		in, out := 0, 0
+		// Anthropic 口径：input_tokens 不含缓存读取，缓存读取单列 cache_read_input_tokens。
+		in, out, cached := 0, 0, 0
 		if e.Usage != nil {
-			in, out = e.Usage.InputTokens, e.Usage.OutputTokens
+			in, out, cached = e.Usage.InputTokens-e.Usage.CachedInputTokens, e.Usage.OutputTokens, e.Usage.CachedInputTokens
 		}
 		dst = append(dst, `,"stop_sequence":null},"usage":{"input_tokens":`...)
 		dst = sse.AppendInt(dst, int64(in))
+		dst = append(dst, `,"cache_read_input_tokens":`...)
+		dst = sse.AppendInt(dst, int64(cached))
 		dst = append(dst, `,"output_tokens":`...)
 		dst = sse.AppendInt(dst, int64(out))
 		dst = append(dst, `}}`...)
@@ -348,7 +353,9 @@ func AppendResponsesEvent(dst []byte, e ResponsesEvent) []byte {
 		if e.Usage != nil {
 			dst = append(dst, `,"usage":{"input_tokens":`...)
 			dst = sse.AppendInt(dst, int64(e.Usage.InputTokens))
-			dst = append(dst, `,"input_tokens_details":{"cached_tokens":0},"output_tokens":`...)
+			dst = append(dst, `,"input_tokens_details":{"cached_tokens":`...)
+			dst = sse.AppendInt(dst, int64(e.Usage.CachedInputTokens))
+			dst = append(dst, `},"output_tokens":`...)
 			dst = sse.AppendInt(dst, int64(e.Usage.OutputTokens))
 			dst = append(dst, `,"output_tokens_details":{"reasoning_tokens":`...)
 			dst = sse.AppendInt(dst, int64(e.Usage.ReasoningTokens))

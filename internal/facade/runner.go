@@ -491,10 +491,20 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	}
 	// 用量按真正发往上游的条目计（图片预处理之后，连同补种的消息），与上游生成并行计数
 	inputTokens := countInputAsync(append(seeded, inputItems...))
+	cachedTokens := func() int { return 0 }
 	if req.Native != nil && req.Native.plan.continued {
 		// 增量只是上游会话的一小段：模型每轮读的是整段会话，用量按完整上下文计
-		// （Codex 也据此判断窗口占用、决定何时压缩）。
+		// （Codex 也据此判断窗口占用、决定何时压缩）。其中上游会话里已有、本轮没重发的部分
+		// 报为缓存命中（cached_tokens），与官方 API 对重复前缀的计价一致 —— 以前全按输入价计，
+		// 长会话每轮都把整段上下文按全价收一遍。
+		sent := inputTokens
 		inputTokens = countInputAsync(req.Native.conv.logicalItems())
+		cachedTokens = func() int { return max(0, inputTokens()-sent()) }
+	}
+	usageOf := func() *prism.Usage {
+		u := measuredUsage(inputTokens(), result)
+		u.CachedInputTokens = cachedTokens()
+		return u
 	}
 
 	// 2.5) 工作区同步。沙箱只把它第一次同步的那个项目、当时已登记的文件落进工作区 ——
@@ -746,7 +756,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			// 上游轮询响应从不回 usage（顶层与 payload 均无此键，抓包实证），
 			// 按本轮实际收发内容精确计数（见 usage.go）。
 			if result.Usage == nil {
-				result.Usage = measuredUsage(inputTokens(), result)
+				result.Usage = usageOf()
 			}
 			if result.ProjectID != "" && result.ConversationID != "" {
 				r.projects.Put(acct.ID, "cid:"+result.ConversationID, result.ProjectID, time.Now())
@@ -933,7 +943,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			}
 			// 用量计算与上方 start 直达完成路径同款。
 			if result.Usage == nil {
-				result.Usage = measuredUsage(inputTokens(), result)
+				result.Usage = usageOf()
 			}
 			if result.ProjectID != "" && result.ConversationID != "" {
 				r.projects.Put(acct.ID, "cid:"+result.ConversationID, result.ProjectID, time.Now())

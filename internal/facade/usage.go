@@ -66,7 +66,7 @@ func newChatUsage(u *prism.Usage) *ChatUsage {
 		PromptTokens:            u.InputTokens,
 		CompletionTokens:        u.OutputTokens,
 		TotalTokens:             u.TotalTokens,
-		PromptTokensDetails:     &PromptTokensDetails{},
+		PromptTokensDetails:     &PromptTokensDetails{CachedTokens: u.CachedInputTokens},
 		CompletionTokensDetails: &CompletionTokensDetails{ReasoningTokens: u.ReasoningTokens},
 	}
 }
@@ -74,6 +74,7 @@ func newChatUsage(u *prism.Usage) *ChatUsage {
 func newResponsesUsage(u *prism.Usage) *ResponsesUsage {
 	return &ResponsesUsage{
 		InputTokens:         u.InputTokens,
+		InputTokensDetails:  ResponsesInputTokenDetails{CachedTokens: u.CachedInputTokens},
 		OutputTokens:        u.OutputTokens,
 		TotalTokens:         u.TotalTokens,
 		OutputTokensDetails: ResponsesOutputTokenDetails{ReasoningTokens: u.ReasoningTokens},

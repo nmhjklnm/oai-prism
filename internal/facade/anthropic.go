@@ -225,8 +225,9 @@ func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *
 	}
 	if res != nil && res.Usage != nil {
 		resp.Usage = AnthropicUsage{
-			InputTokens:  res.Usage.InputTokens,
-			OutputTokens: res.Usage.OutputTokens,
+			InputTokens:          res.Usage.InputTokens - res.Usage.CachedInputTokens,
+			OutputTokens:         res.Usage.OutputTokens,
+			CacheReadInputTokens: res.Usage.CachedInputTokens,
 		}
 	} else {
 		resp.Usage = AnthropicUsage{OutputTokens: tokens.Count(text)}

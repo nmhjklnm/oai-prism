@@ -451,6 +451,9 @@ type Usage struct {
 	TotalTokens  int `json:"total_tokens"`
 	// ReasoningTokens 是 OutputTokens 中推理文本所占的部分（与 OpenAI 口径一致，已含在 OutputTokens 内）。
 	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	// CachedInputTokens 是 InputTokens 中上游会话里已有、本轮没有重新发送的部分（OpenAI 口径：
+	// 已含在 InputTokens 内），按缓存命中计价。
+	CachedInputTokens int `json:"cached_input_tokens,omitempty"`
 }
 
 // Sandbox 是一次沙箱申请的结果。

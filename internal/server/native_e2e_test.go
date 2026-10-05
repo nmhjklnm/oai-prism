@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -347,4 +349,36 @@ func postAsync(url, body string, hdr map[string]string) <-chan struct{} {
 		}
 	}()
 	return done
+}
+
+// 续接轮次的用量：输入按整段会话计，其中上游会话里已有、本轮没重发的部分报为缓存命中；
+// 新建会话那一轮全是新发的，缓存为 0。
+func TestE2E_Native_ReportsCachedInput(t *testing.T) {
+	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
+	hdr := map[string]string{"Content-Type": "application/json", "X-Oaiprism-Session": "codex-cached-1"}
+	usage := func(out string) (in, cached int) {
+		t.Helper()
+		mi := regexp.MustCompile(`"input_tokens":(\d+)`).FindAllStringSubmatch(out, -1)
+		mc := regexp.MustCompile(`"input_tokens_details":\{"cached_tokens":(\d+)\}`).FindAllStringSubmatch(out, -1)
+		if len(mi) == 0 || len(mc) == 0 {
+			t.Fatalf("响应里没有用量: %.300s", out)
+		}
+		in, _ = strconv.Atoi(mi[len(mi)-1][1])
+		cached, _ = strconv.Atoi(mc[len(mc)-1][1])
+		return in, cached
+	}
+	turn1 := []any{
+		codexMsg("developer", "<permissions instructions>"+strings.Repeat("规则 ", 3000)+"</permissions instructions>"),
+		codexMsg("user", "第一问"),
+	}
+	_, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses", codexBody(t, "turn", turn1...), hdr)
+	if in, cached := usage(out); cached != 0 || in < 3000 {
+		t.Fatalf("新建会话那一轮不该有缓存命中: in=%d cached=%d", in, cached)
+	}
+	turn2 := append(append([]any{}, turn1...), codexMsg("assistant", "好"), codexMsg("user", "第二问"))
+	_, out = doLocal(t, http.MethodPost, ts.URL+"/v1/responses", codexBody(t, "turn", turn2...), hdr)
+	in, cached := usage(out)
+	if cached < 3000 || cached >= in || in-cached > 2000 {
+		t.Fatalf("续接轮次应把已在上游会话里的部分报为缓存命中: in=%d cached=%d", in, cached)
+	}
 }
