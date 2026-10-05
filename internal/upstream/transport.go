@@ -36,6 +36,10 @@ type Options struct {
 	CacheDir    string // sdk.js 缓存目录
 	Logger      *slog.Logger
 
+	// Presign / PresignMaxAge 透传给签发器（提前签好备用的 token，见 sentinel/presign.go）。
+	Presign       int
+	PresignMaxAge time.Duration
+
 	// Signer 可注入（测试或多个传输共用一个签发器）；nil 时自建。
 	Signer *sentinel.Signer
 }
@@ -486,6 +490,7 @@ func Shared(o Options) (*Transport, error) {
 		}
 		shared.signer, err = sentinel.New(sentinel.Options{
 			Doer: &doer{c: sc, profile: prof}, Profile: prof, CacheDir: cacheDir, Logger: o.Logger,
+			Presign: o.Presign, PresignMaxAge: o.PresignMaxAge,
 		})
 		if err != nil {
 			return nil, err

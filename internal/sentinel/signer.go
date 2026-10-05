@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -47,6 +48,11 @@ type Options struct {
 	CacheDir string   // sdk.js 的磁盘缓存目录；空则只缓存在内存
 	PageTTL  time.Duration
 	Logger   *slog.Logger
+
+	// Presign 是提前签好备用的 token 数，0 = 现签现用（见 presign.go）。
+	Presign int
+	// PresignMaxAge 是备用 token 的最长存放时间，超过就丢弃；默认 15 秒。
+	PresignMaxAge time.Duration
 }
 
 const (
@@ -69,6 +75,12 @@ type Signer struct {
 	signed  int64
 	failed  int64
 	lastErr string
+
+	pre *presigner // nil = 现签现用
+
+	// 计时：调用方在 Token 里总共等了多久（含排队）、真正签名花了多久。
+	waitNs, waitN atomic.Int64
+	signNs, signN atomic.Int64
 }
 
 // Stats 是签发器的运行状况。
@@ -77,6 +89,15 @@ type Stats struct {
 	Failed    int64     `json:"failed"`
 	LastError string    `json:"last_error,omitempty"`
 	PageSince time.Time `json:"page_since,omitzero"`
+
+	// Calls 是 Token 被调用的次数，WaitTotal 是调用方在里面等的总时长（含排队）；
+	// SignTotal 是真正签名的总时长（次数 = Signed + Failed）。
+	Calls     int64         `json:"calls"`
+	WaitTotal time.Duration `json:"wait_total"`
+	SignTotal time.Duration `json:"sign_total"`
+	// 提前签名：来了就有现成的次数、放太久丢弃的次数。
+	PresignHits  int64 `json:"presign_hits"`
+	PresignStale int64 `json:"presign_stale"`
 }
 
 // TokenError 表示 SDK 产出的是错误载荷（{"e":...}）而不是 token。
@@ -104,17 +125,40 @@ func New(o Options) (*Signer, error) {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	return &Signer{o: o, profile: p, log: o.Logger, sdk: map[string]string{}}, nil
+	s := &Signer{o: o, profile: p, log: o.Logger, sdk: map[string]string{}}
+	if o.Presign > 0 {
+		if o.PresignMaxAge <= 0 {
+			o.PresignMaxAge = 15 * time.Second
+		}
+		s.pre = newPresigner(s.signLocked, o.Presign, o.PresignMaxAge)
+	}
+	return s, nil
 }
 
 // Profile 返回签发器扮演的浏览器指纹（出站请求头要与之一致）。
 func (s *Signer) Profile() *Profile { return s.profile }
 
-// Token 签一个一次性的 OpenAI-Sentinel-Token。
+// Token 签一个一次性的 OpenAI-Sentinel-Token（开了提前签名时取一个签好的）。
 func (s *Signer) Token(ctx context.Context) (string, error) {
+	t0 := time.Now()
+	defer func() {
+		s.waitNs.Add(int64(time.Since(t0)))
+		s.waitN.Add(1)
+	}()
+	if s.pre != nil {
+		return s.pre.take(ctx)
+	}
+	return s.signLocked(ctx)
+}
+
+// signLocked 现签一个（一次只签一个）。
+func (s *Signer) signLocked(ctx context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	t0 := time.Now()
 	tok, err := s.token(ctx)
+	s.signNs.Add(int64(time.Since(t0)))
+	s.signN.Add(1)
 	if err != nil {
 		s.failed++
 		s.lastErr = err.Error()
@@ -153,15 +197,22 @@ func (s *Signer) token(ctx context.Context) (string, error) {
 func (s *Signer) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Stats{Signed: s.signed, Failed: s.failed, LastError: s.lastErr}
+	st := Stats{Signed: s.signed, Failed: s.failed, LastError: s.lastErr,
+		Calls: s.waitN.Load(), WaitTotal: time.Duration(s.waitNs.Load()), SignTotal: time.Duration(s.signNs.Load())}
+	if s.pre != nil {
+		st.PresignHits, st.PresignStale = s.pre.hits.Load(), s.pre.stale.Load()
+	}
 	if s.pg != nil {
 		st.PageSince = s.pg.born
 	}
 	return st
 }
 
-// Close 关掉页面。
+// Close 关掉页面（连同提前签名的后台循环）。
 func (s *Signer) Close() {
+	if s.pre != nil {
+		s.pre.close()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropPage("")

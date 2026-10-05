@@ -28,6 +28,7 @@ import (
 	"github.com/oai-prism/oaiprism/internal/prism"
 	"github.com/oai-prism/oaiprism/internal/rawproxy"
 	"github.com/oai-prism/oaiprism/internal/tokens"
+	"github.com/oai-prism/oaiprism/internal/upstream"
 )
 
 // Server 是完整运行实例。
@@ -318,6 +319,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			if err := s.app.Reg.Render(w); err != nil {
 				s.log.Debug("输出指标失败", "err", err)
 			}
+			writeSentinelMetrics(w)
 		})
 	}
 
@@ -1128,4 +1130,20 @@ func (s *Server) syncPoolFromSQLite() error {
 	}
 	s.log.Info("SQLite 账号池已实时重载同步", "count", s.pool.Size())
 	return nil
+}
+
+// writeSentinelMetrics 追加 Sentinel 签发器的计时：调用方在取 token 上等了多久（含排队）、
+// 真正签名花了多久、提前签名命中与过期丢弃的次数。签发器还没建过时不输出。
+func writeSentinelMetrics(w io.Writer) {
+	sg := upstream.SharedSigner()
+	if sg == nil {
+		return
+	}
+	st := sg.Stats()
+	fmt.Fprintf(w, "# HELP oaiprism_sentinel_wait_seconds 调用方取 Sentinel token 的等待（含排队）\n# TYPE oaiprism_sentinel_wait_seconds summary\n")
+	fmt.Fprintf(w, "oaiprism_sentinel_wait_seconds_sum %g\noaiprism_sentinel_wait_seconds_count %d\n", st.WaitTotal.Seconds(), st.Calls)
+	fmt.Fprintf(w, "# HELP oaiprism_sentinel_sign_seconds 真正签名的耗时\n# TYPE oaiprism_sentinel_sign_seconds summary\n")
+	fmt.Fprintf(w, "oaiprism_sentinel_sign_seconds_sum %g\noaiprism_sentinel_sign_seconds_count %d\n", st.SignTotal.Seconds(), st.Signed+st.Failed)
+	fmt.Fprintf(w, "# HELP oaiprism_sentinel_presign_total 提前签名：hit=来了就有现成的，stale=放太久丢弃\n# TYPE oaiprism_sentinel_presign_total counter\n")
+	fmt.Fprintf(w, "oaiprism_sentinel_presign_total{result=\"hit\"} %d\noaiprism_sentinel_presign_total{result=\"stale\"} %d\n", st.PresignHits, st.PresignStale)
 }

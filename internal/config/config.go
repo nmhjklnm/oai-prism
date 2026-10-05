@@ -120,6 +120,13 @@ type UpstreamConfig struct {
 	// 并用纯 Go 签发 Sentinel token（internal/upstream），User-Agent 等浏览器头也以指纹为准。
 	SentinelProfile string `yaml:"sentinel_profile"`
 
+	// SentinelPresign 是提前签好备用的 Sentinel token 数（0 = 现签现用）。
+	// 现签每次 24 毫秒到 0.5 秒且串行，直接压在发起与每次轮询的等待里；后台先签好
+	// 就省掉这段。用掉一个才补一个，闲着时不持续签。
+	SentinelPresign int `yaml:"sentinel_presign"`
+	// SentinelPresignMaxAge 是备用 token 的最长存放时间，超过就丢弃（前端是签完立刻用）。
+	SentinelPresignMaxAge time.Duration `yaml:"sentinel_presign_max_age"`
+
 	UserAgent string            `yaml:"user_agent"`
 	Origin    string            `yaml:"origin"`
 	Referer   string            `yaml:"referer"`
@@ -504,6 +511,8 @@ func Default() *Config {
 		},
 		Upstream: UpstreamConfig{
 			BaseURL:               "https://prism.openai.com",
+			SentinelPresign:       2,
+			SentinelPresignMaxAge: 15 * time.Second,
 			Timeout:               0,
 			DialTimeout:           10 * time.Second,
 			KeepAlive:             30 * time.Second,

@@ -47,6 +47,12 @@ upstream:
   # 想沿用自己电脑的指纹，把快照存成 JSON（形状同 internal/sentinel/profile_default.json）指过来。
   # sentinel_profile: secrets/sentinel_profile.json
 
+  # 提前签好备用的 Sentinel token 数（0 = 现签现用）。现签每次 24 毫秒到 0.5 秒且串行，
+  # 直接压在发起与每次轮询的等待里；用掉一个才补一个，闲着时不持续签。
+  sentinel_presign: 2
+  # 备用 token 最长存放多久，超过就丢弃（前端是签完立刻用）。
+  sentinel_presign_max_age: 15s
+
   # 单个请求整体超时。0 = 不设上限，由 context 精确控制。
   # 强烈建议保持 0：流式与长轮询都需要"多久都等"。
   timeout: 0s

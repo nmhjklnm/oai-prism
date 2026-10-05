@@ -76,8 +76,10 @@ func New(cfg config.UpstreamConfig, opts Options) (*Client, error) {
 		// prism.openai.com 在 Cloudflare 后面校验 TLS 指纹，标准库直连会被 403：
 		// 改走 Chrome 指纹传输（同时负责会话换发与 Sentinel 签发）。
 		bt, err := upstream.Shared(upstream.Options{
-			Proxy:       pick(cfg.HTTPProxy, opts.Proxy),
-			ProfilePath: cfg.SentinelProfile,
+			Proxy:         pick(cfg.HTTPProxy, opts.Proxy),
+			ProfilePath:   cfg.SentinelProfile,
+			Presign:       cfg.SentinelPresign,
+			PresignMaxAge: cfg.SentinelPresignMaxAge,
 		})
 		if err != nil {
 			return nil, err
