@@ -163,3 +163,25 @@ func TestE2E_PlatformNoticeCanBeDisabled(t *testing.T) {
 		t.Fatal("platform_notice 关闭后不应注入声明")
 	}
 }
+
+// code mode 的 exec 嵌套工具（出图等）要到达上游 system —— 2026-10-05 前只给每个工具描述的第一段，
+// 咕咕打开出图后模型仍答「没有出图工具」。
+func TestE2E_Bridge_CodeModeExecToolsReachUpstream(t *testing.T) {
+	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), nil)
+	desc := "Run JavaScript code to orchestrate/compose tool calls\\n- Global helpers:\\n- `generatedImage(result)`: Appends an image-generation result.\\n\\n" +
+		"### `exec_command`\\nRuns a command.\\n\\n## image_gen\\nTools in the image_gen namespace.\\n\\n" +
+		"### `image_gen__imagegen`\\nThe `image_gen.imagegen` tool enables image generation.\\n\\nexec tool declaration:\\ndeclare const tools: { image_gen__imagegen(args: { prompt: string; }): Promise<unknown>; };\\n"
+	postLocal(t, ts.URL+"/v1/responses", `{"model":"gpt-5","input":[
+		{"type":"additional_tools","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec","description":"`+desc+`"}]}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"画一个红苹果"}]}]}`)
+
+	sys, _ := requireSystemUser(t, upstreamInput(t, up, 0))
+	for _, want := range []string{"[CLIENT EXEC TOOLS", "### tools.image_gen__imagegen", "image_gen__imagegen(args: { prompt: string; })", "generatedImage(result)"} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("桥 system 缺少 %q", want)
+		}
+	}
+	if strings.Contains(sys, "### tools.exec_command") {
+		t.Errorf("exec_command 桥已单独写过，不该重复")
+	}
+}

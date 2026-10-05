@@ -300,7 +300,7 @@ func TestBridgeToolCallsNamespaced(t *testing.T) {
 	hist := `[{"type":"function_call","call_id":"c1","namespace":"mcp__gugu","name":"session_open_in_tab","arguments":"{\"path\":\"a.html\"}"},
  {"type":"function_call_output","call_id":"c1","output":"opened"}]`
 	var got strings.Builder
-	for _, it := range bridgeInputItems(json.RawMessage(hist), "", nil) {
+	for _, it := range bridgeInputItems(json.RawMessage(hist), "", nil, "") {
 		got.WriteString(itemText(it))
 	}
 	if !strings.Contains(got.String(), "tools.mcp__gugu__session_open_in_tab(") {
@@ -322,8 +322,8 @@ func TestTurnAbortedStaysInTimeline(t *testing.T) {
  {"type":"message","role":"user","content":[{"type":"input_text","text":"do it"}]}`
 	aborted := `,{"type":"message","role":"developer","content":[{"type":"input_text","text":"<turn_aborted>\nThe previous turn was interrupted on purpose.\n</turn_aborted>"}]},
  {"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}`
-	before := bridgeInputItems(json.RawMessage("["+base+"]"), "", nil)
-	after := bridgeInputItems(json.RawMessage("["+base+aborted+"]"), "", nil)
+	before := bridgeInputItems(json.RawMessage("["+base+"]"), "", nil, "")
+	after := bridgeInputItems(json.RawMessage("["+base+aborted+"]"), "", nil, "")
 	if itemText(before[0]) != itemText(after[0]) {
 		t.Fatal("打断提示不应改变 system")
 	}
@@ -341,7 +341,7 @@ func TestToolOutputImagesForwarded(t *testing.T) {
 	hist := `[{"type":"message","role":"user","content":[{"type":"input_text","text":"看图"}]},
  {"type":"custom_tool_call","call_id":"c1","name":"exec","input":"await tools.view_image({path:'a.png'})"},
  {"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]`
-	items := bridgeInputItems(json.RawMessage(hist), "", nil)
+	items := bridgeInputItems(json.RawMessage(hist), "", nil, "")
 	last := items[len(items)-1]
 	var img, txt int
 	for _, c := range last.Content {

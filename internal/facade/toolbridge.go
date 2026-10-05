@@ -108,7 +108,7 @@ func hasPriorToolResult(raw map[string]json.RawMessage) bool {
 		strings.Contains(s, `"function_call_output"`)
 }
 
-func bridgePrompt(nativePatch bool, extraTools []clientTool) string {
+func bridgePrompt(nativePatch bool, extraTools []clientTool, execDocs string) string {
 	sections := []string{
 		"<local_tool_bridge>",
 		`You are the reasoning engine for a LOCAL coding agent (Codex CLI). The client executes ALL tools locally on the user's machine.`,
@@ -154,6 +154,9 @@ func bridgePrompt(nativePatch bool, extraTools []clientTool) string {
 	)
 	if docs := toolDocsSection(extraTools); docs != "" {
 		sections = append(sections, "", docs)
+	}
+	if execDocs != "" {
+		sections = append(sections, "", execDocs)
 	}
 	sections = append(sections,
 		``,
@@ -441,7 +444,8 @@ func osDirective(ua string) string {
 //
 // extraTools 是请求里注册的非内建工具（registeredClientTools 的结果，
 // 由调用方解析一次传入）：列进桥指令，模型才知道有 MCP 等工具可调。
-func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []clientTool) []prism.InputItem {
+// execDocs 是 code mode 下 exec 的嵌套工具说明（execToolsSection 的结果，见 exectools.go）。
+func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []clientTool, execDocs string) []prism.InputItem {
 	var blocks []struct {
 		Type      string `json:"type"`
 		Role      string `json:"role"`
@@ -544,7 +548,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string, extraTools []cl
 
 	items := make([]prism.InputItem, 0, len(blocks)+2)
 	// OS 事实声明（可能为空）拼在桥指令最前面 —— 越靠前越是"背景事实"。
-	head := bridgePrompt(strings.Contains(string(raw), "apply_patch(input: string)"), extraTools)
+	head := bridgePrompt(strings.Contains(string(raw), "apply_patch(input: string)"), extraTools, execDocs)
 	if strings.TrimSpace(defaultSystem) != "" {
 		head = defaultSystem + "\n\n" + head
 	}

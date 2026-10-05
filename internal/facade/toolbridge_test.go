@@ -268,7 +268,7 @@ func TestBridgeResultTextArray(t *testing.T) {
 		{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"echo hi\"}"},
 		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed"},{"type":"input_text","text":"{\"chunk_id\":\"x\"}"}]}
 	]`)
-	items := bridgeInputItems(raw, "sys", nil)
+	items := bridgeInputItems(raw, "sys", nil, "")
 	b, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -329,7 +329,7 @@ func TestBridgeInputReplayFunctionCall(t *testing.T) {
 		{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"Set-Content -Path 'a.txt' -Value 'hi'\"}"},
 		{"type":"function_call_output","call_id":"c1","output":"Added a.txt (+1 -0)"}
 	]`)
-	items := bridgeInputItems(raw, "sys", nil)
+	items := bridgeInputItems(raw, "sys", nil, "")
 	b, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -388,7 +388,7 @@ func TestBridgeInputItems(t *testing.T) {
 		{"type":"custom_tool_call_output","call_id":"c1","output":"[CLIENT RESULT]\nfile written\n[/CLIENT RESULT]"},
 		{"type":"reasoning","summary":[]}
 	]`)
-	items := bridgeInputItems(raw, "base", nil)
+	items := bridgeInputItems(raw, "base", nil, "")
 	if len(items) == 0 {
 		t.Fatal("翻译结果为空")
 	}
@@ -530,7 +530,7 @@ func TestBridgeInputItems_And_FoldInputHistory_MultiTurnToolExecution(t *testing
 		{"type":"message","role":"user","content":"你文件输出的路径在哪里？"}
 	]`
 
-	items := bridgeInputItems([]byte(rawJSON), "default-sys", nil)
+	items := bridgeInputItems([]byte(rawJSON), "default-sys", nil, "")
 	if len(items) == 0 {
 		t.Fatalf("bridgeInputItems 解析失败")
 	}

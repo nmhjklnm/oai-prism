@@ -39,7 +39,7 @@ func TestRemoteCompaction_EncodeDecode(t *testing.T) {
 func TestRemoteCompaction_BridgeInput(t *testing.T) {
 	trig := bridgeInputItems(json.RawMessage(`[
 		{"type":"message","role":"user","content":[{"type":"input_text","text":"暗号是 PINEAPPLE-42"}]},
-		{"type":"compaction_trigger"}]`), "", nil)
+		{"type":"compaction_trigger"}]`), "", nil, "")
 	if got := itemText(trig[len(trig)-1]); got != compactionTriggerPrompt {
 		t.Fatalf("最后一条应是摘要提示词: %q", got)
 	}
@@ -48,7 +48,7 @@ func TestRemoteCompaction_BridgeInput(t *testing.T) {
 	after := bridgeInputItems(json.RawMessage(`[
 		{"type":"message","role":"user","content":[{"type":"input_text","text":"暗号是 PINEAPPLE-42"}]},
 		{"type":"compaction","encrypted_content":`+string(enc)+`},
-		{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}]`), "", nil)
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}]`), "", nil, "")
 	var found bool
 	for _, it := range after {
 		if it.Role == "user" && strings.Contains(itemText(it), "下一步跑 echo step3") {

@@ -38,6 +38,10 @@ type responsesTurn struct {
 	// 对应的 function_call 交给客户端执行。
 	clientTools []clientTool
 
+	// execDocs：code mode 下 exec 的嵌套工具说明（见 exectools.go），列进桥指令；
+	// 模型在 codex-exec 块里调用它们，块原样交给客户端执行。
+	execDocs string
+
 	// userQuery：本轮用户的原始提问（见 websearch.go 的 lastUserQuestion），
 	// 用于合成 web_search_call 展示条目的查询词。
 	userQuery string
@@ -140,6 +144,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		remoteCompaction: remoteCompaction,
 		nativePatch:      hasNativeApplyPatch(rawFields),
 		clientTools:      registeredClientTools(rawFields),
+		execDocs:         execToolsSection(rawFields),
 		userQuery:        lastUserQuestion(rawFields),
 	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
@@ -167,7 +172,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var skills string
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
-		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()), turn.clientTools)
+		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()), turn.clientTools, turn.execDocs)
 		if input, skills = compactSkills(input, promptLimit); skills != "" {
 			h.log.Debug("技能清单过大，移出 system（新建上游会话时单独补种）", "bytes", len(skills))
 		}
