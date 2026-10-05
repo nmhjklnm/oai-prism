@@ -1,32 +1,42 @@
 package facade
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/oai-prism/oaiprism/internal/prism"
 )
 
-// 技能清单转附件。
+// 技能清单单独补种。
 //
 // Codex 把本机全部技能（名字 + 描述 + SKILL.md 路径）作为一条 <skills_instructions>
-// developer 消息发来，桥把它原样并进 system。技能一多它就是 system 里最大的一块：
-// 2026-10-05 实测一个 Codex 客户端带着 235 个技能，这一块 70 KB，首轮合计 109 KB，超过上游
-// 单条约 100 KiB 的上限，一句 "hi" 都发不出去（context_length_exceeded）。
+// developer 消息发来，桥把它并进 system。技能一多它就是 system 里最大的一块：
+// 2026-10-05 实测一个 Codex 客户端带着 235 个技能，这一块 70 KB，首轮合计 109 KB，
+// 超过上游单条约 100 KiB 的上限，一句 "hi" 都发不出去（context_length_exceeded）。
 //
-// 同类项目：free-astra 整块删掉，prism-bridge 不转发长的客户端说明。这里折中：system
-// 超过单条上限的 skillsCompactShare 时，清单里每个技能只留名字和路径，带描述的完整清单
-// 作为附件登记进项目（prism-uploads/，文件名取内容指纹，同一份只传一次），模型拿不准
-// 用哪个技能时去读。没超就原样发 —— 描述是选技能的依据，放得下就带着。
+// 这份清单是 Codex 认定模型必须知道的指令，不能删，也不能交给模型"需要时去读"
+// （读不读由它决定，等于可能没送到）。所以 system 超过单条上限的 skillsCompactShare
+// 时：system 里每个技能只留名字和路径；完整清单在新建上游会话时、本轮之前单独补种
+// （一段放不下就分几段），由网关保证送到。上游会话保管历史，之后各轮不再重发。
+// 没超就原样留在 system 里。
 //
 // 判据只看 system、不看本轮 user：同一会话的 system 不变，压不压缩就不会逐轮翻转
 // （system 指纹一变，原生续接就要整份重发 system，见 native.go）。
 
-// skillsCompactShare 是 system 占单条上限的比例，超过就精简技能清单（剩下的留给本轮消息）。
+// skillsCompactShare 是 system 占单条上限的比例，超过就把技能清单移出 system（剩下的留给本轮消息）。
 const skillsCompactShare = 0.6
+
+const (
+	skillsSeedSystem = "The client's skills list follows. It is part of your standing instructions for this whole " +
+		"conversation: later turns name these skills and expect you to know what each one is for. Do not act on it now; " +
+		"reply with exactly OK."
+	skillsSeedHeader = "[Client skills list, part %d of %d]\n"
+	// skillsCompactNote 写在 system 精简清单的开头，指向补种进会话的完整清单。
+	skillsCompactNote = "(The full skills list, with what each skill is for, was delivered at the start of this conversation " +
+		"in the messages headed [Client skills list]. It is part of your instructions and stays in force; the entries " +
+		"below repeat only names and paths. The SKILL.md paths are on the CLIENT machine: read them with exec_command as usual.)"
+)
 
 var (
 	skillsBlockRe = regexp.MustCompile(`(?s)<skills_instructions>.*?</skills_instructions>`)
@@ -34,33 +44,25 @@ var (
 	skillEntryRe = regexp.MustCompile(`^- ([^:\n]+): .*\(file: ([^)\n]+)\)\s*$`)
 )
 
-// contextFile 是桥改写请求时另行登记进项目的附件。
-type contextFile struct {
-	Name string // prism-uploads/ 下的文件名
-	Data []byte
-}
-
-// compactSkills 在 system 超出预算时把技能清单换成精简版，返回改写后的条目与要登记的完整清单。
-// 不需要或认不出清单时原样返回、附件为 nil。
-func compactSkills(items []prism.InputItem, limit int) ([]prism.InputItem, *contextFile) {
+// compactSkills 在 system 超出预算时把技能清单换成精简版，返回改写后的条目与完整清单
+// （由原生续接在新建上游会话时补种）。不需要或认不出清单时原样返回、清单为空。
+func compactSkills(items []prism.InputItem, limit int) ([]prism.InputItem, string) {
 	if limit <= 0 {
-		return items, nil
+		return items, ""
 	}
 	for i, it := range items {
 		if !isSystemRole(it.Role) {
 			continue
 		}
 		for j, c := range it.Content {
-			if c.Type != prism.BlockInputText || len(c.Text) <= int(float64(limit)*skillsCompactShare) {
+			if c.Type != prism.BlockInputText || float64(len(c.Text)) <= float64(limit)*skillsCompactShare {
 				continue
 			}
 			block := skillsBlockRe.FindString(c.Text)
 			if block == "" {
 				continue
 			}
-			sum := sha256.Sum256([]byte(block))
-			name := "codex-skills-" + hex.EncodeToString(sum[:6]) + ".md"
-			compact, ok := compactSkillsBlock(block, prism.UploadDir+"/"+name)
+			compact, ok := compactSkillsBlock(block)
 			if !ok {
 				continue
 			}
@@ -70,27 +72,21 @@ func compactSkills(items []prism.InputItem, limit int) ([]prism.InputItem, *cont
 			copy(contents, it.Content)
 			contents[j].Text = strings.Replace(c.Text, block, compact, 1)
 			out[i].Content = contents
-			return out, &contextFile{Name: name, Data: []byte(block)}
+			return out, block
 		}
 	}
-	return items, nil
+	return items, ""
 }
 
-// compactSkillsBlock 去掉每条技能的描述，只留名字和路径，并说明完整清单在附件 rel 里。
-// 一条技能都认不出时返回 false（格式变了，宁可原样发）。
-func compactSkillsBlock(block, rel string) (string, bool) {
-	note := "(Descriptions are omitted here to fit the upstream size limit. The full list, saying what each skill is for, " +
-		"is the attached project file `" + rel + "` — read it with your read-only file tool, relative to your sandbox working " +
-		"directory, when you need to decide whether a skill applies. The SKILL.md paths below are on the CLIENT machine: " +
-		"read them with exec_command as usual.)"
+// compactSkillsBlock 去掉每条技能的描述，只留名字和路径。一条都认不出时返回 false（格式变了，宁可原样发）。
+func compactSkillsBlock(block string) (string, bool) {
 	lines := strings.Split(block, "\n")
 	out := make([]string, 0, len(lines)+1)
-	n, noted := 0, false
+	n := 0
 	for _, l := range lines {
 		if m := skillEntryRe.FindStringSubmatch(l); m != nil {
-			if !noted {
-				out = append(out, note)
-				noted = true
+			if n == 0 {
+				out = append(out, skillsCompactNote)
 			}
 			out = append(out, "- "+strings.TrimSpace(m[1])+" (file: "+strings.TrimSpace(m[2])+")")
 			n++
@@ -101,30 +97,36 @@ func compactSkillsBlock(block, rel string) (string, bool) {
 	return strings.Join(out, "\n"), n > 0
 }
 
-// attachContextFiles 把桥改写出的附件登记进项目；同一份内容只传一次（项目里已有同名文件也不重传）。
-// 返回本轮是否有新登记 —— 调用方据此换沙箱，让文件落进工作区。
-// 登记失败只记日志：模型读不到完整清单，但精简版里的名字和路径仍可用。
-func (r *Runner) attachContextFiles(ctx context.Context, p prism.Principal, accountID, projectID string, files []contextFile) bool {
-	if projectID == "" || r.client == nil {
-		return false
+// skillsSeedTurns 把完整技能清单切成补种消息，每段不超过单条上限；按行切，不切开一条技能。
+func skillsSeedTurns(block string, limit int) [][]prism.InputItem {
+	budget := limit - len(skillsSeedSystem) - 64 - promptOverheadReserve
+	if block == "" || limit <= 0 || budget < 4096 {
+		return nil
 	}
-	var added bool
-	for _, f := range files {
-		key := uploadKey(accountID, projectID, f.Data)
-		if _, ok := r.uploads.Get(key); ok {
-			continue
+	var chunks []string
+	var cur strings.Builder
+	for _, l := range strings.Split(block, "\n") {
+		if len(l) > budget {
+			l = cutUTF8(l, budget-32) + " …[truncated]"
 		}
-		projectPath, uploaded, err := r.client.EnsureProjectFile(ctx, p, projectID, f.Name, "text/markdown", f.Data)
-		if err != nil {
-			r.log.Warn("附件登记进项目失败，模型只能看到精简清单", "project", projectID, "file", f.Name, "err", err)
-			continue
+		if cur.Len() > 0 && cur.Len()+len(l)+1 > budget {
+			chunks = append(chunks, cur.String())
+			cur.Reset()
 		}
-		r.uploads.Put(key, projectPath)
-		if uploaded {
-			added = true
-			r.uploads.MarkProject(projectID)
-			r.log.Info("附件已登记进项目", "project", projectID, "path", projectPath, "bytes", len(f.Data))
+		if cur.Len() > 0 {
+			cur.WriteByte('\n')
 		}
+		cur.WriteString(l)
 	}
-	return added
+	if cur.Len() > 0 {
+		chunks = append(chunks, cur.String())
+	}
+	out := make([][]prism.InputItem, 0, len(chunks))
+	for k, c := range chunks {
+		out = append(out, []prism.InputItem{
+			prism.NewSystemItem(skillsSeedSystem),
+			prism.NewUserItem(fmt.Sprintf(skillsSeedHeader, k+1, len(chunks)) + c),
+		})
+	}
+	return out
 }

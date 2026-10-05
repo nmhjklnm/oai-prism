@@ -1782,39 +1782,6 @@ func (c *Client) RegisterProjectFile(ctx context.Context, p Principal, projectID
 	return "/" + UploadDir + "/" + filename, nil
 }
 
-// EnsureProjectFile 确保 prism-uploads/<filename> 已登记进项目文件树：已有同名文件就直接返回
-// （调用方按内容取文件名，同名即同内容），否则上传并登记。uploaded 表示本次确有新登记。
-func (c *Client) EnsureProjectFile(ctx context.Context, p Principal, projectID, filename, contentType string, data []byte) (projectPath string, uploaded bool, err error) {
-	tk, err := c.AcquireYSweetToken(ctx, p, projectID)
-	if err != nil {
-		return "", false, err
-	}
-	state, err := c.yDoc(ctx, p, tk, http.MethodGet, "/as-update", nil)
-	if err != nil {
-		return "", false, err
-	}
-	doc, err := ydoc.Decode(state)
-	if err != nil {
-		return "", false, fmt.Errorf("解析项目文档: %w", err)
-	}
-	projectPath = "/" + UploadDir + "/" + filename
-	if root := doc.Root(); root != "" {
-		if dir, ok := doc.Child(root, UploadDir); ok {
-			if _, ok := doc.Child(dir.ID, filename); ok {
-				return projectPath, false, nil
-			}
-		}
-	}
-	fileID, err := c.UploadRawProjectFile(ctx, p, projectID, filename, contentType, data)
-	if err != nil {
-		return "", false, fmt.Errorf("上传: %w", err)
-	}
-	if _, err := c.RegisterProjectFile(ctx, p, projectID, fileID, filename); err != nil {
-		return "", false, fmt.Errorf("登记进文件树: %w", err)
-	}
-	return projectPath, true, nil
-}
-
 // yDoc 调 Y-Sweet 的文档 HTTP 接口（{baseUrl}/as-update、{baseUrl}/update），以文档令牌鉴权。
 func (c *Client) yDoc(ctx context.Context, p Principal, tk *YSweetToken, method, suffix string, body []byte) ([]byte, error) {
 	u, err := url.Parse(tk.BaseURL)

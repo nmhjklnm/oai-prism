@@ -163,15 +163,13 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var input []prism.InputItem
 	// native 是原生续接用的拆分形态（system / 往轮对话 / 本轮消息，见 native.go）。
 	var native *nativeConversation
-	// contextFiles 是改写请求时另行登记进项目的附件（见 skills.go）。
-	var contextFiles []contextFile
+	// skills 是移出 system 的完整技能清单（见 skills.go）。
+	var skills string
 	if bridge {
 		// UA 推断的 OS 事实声明随桥指令一起进首条 system（见 osDirective）。
 		input = bridgeInputItems(req.Input, osDirective(r.UserAgent()), turn.clientTools)
-		var skills *contextFile
-		if input, skills = compactSkills(input, promptLimit); skills != nil {
-			contextFiles = append(contextFiles, *skills)
-			h.log.Info("技能清单过大，精简后另附完整清单", "file", skills.Name, "bytes", len(skills.Data))
+		if input, skills = compactSkills(input, promptLimit); skills != "" {
+			h.log.Info("技能清单过大，移出 system，新建上游会话时单独补种", "bytes", len(skills))
 		}
 		native = itemsConversation(input)
 		if compaction {
@@ -220,7 +218,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		ExtraHeaders: extractSentinelToken(r),
 		IsAux:        turn.isAux,
 		Bridge:       bridge,
-		ContextFiles: contextFiles,
+		Skills:       skills,
 	}
 	runReq.Extra = passthroughFields(rawFields, responsesKnownFields)
 

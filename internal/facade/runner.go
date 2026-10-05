@@ -77,8 +77,8 @@ type RunRequest struct {
 	// 不再叠加通用的 platformNotice。
 	Bridge bool
 
-	// ContextFiles 是改写请求时另行登记进项目的附件（如完整技能清单，见 skills.go）。
-	ContextFiles []contextFile
+	// Skills 是移出 system 的完整技能清单：新建上游会话时、本轮之前单独补种（见 skills.go）。
+	Skills string
 
 	// Native 非空时走原生续接（见 native.go）：上游保管会话历史，续接时只发增量。
 	// Input 仍是全量折叠后的条目 —— 新建上游会话的首轮与各种回退都发它。
@@ -461,9 +461,6 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	var hasNewUpload bool
 	if projectID != "" {
 		inputItems, hasNewUpload = r.attachImages(ctx, p, acct.ID, projectID, inputItems)
-		if r.attachContextFiles(ctx, p, acct.ID, projectID, req.ContextFiles) {
-			hasNewUpload = true
-		}
 	}
 	// 用量按真正发往上游的条目计（图片预处理之后），与上游生成并行计数
 	inputTokens := countInputAsync(inputItems)

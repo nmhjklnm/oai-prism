@@ -468,6 +468,9 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 	plan.sysHash = textFingerprint(nt.conv.system)
 	plan.sinceSys = len(itemText(nt.conv.current))
 
+	// 移出 system 的完整技能清单：新会话里先补种，排在历史之前（见 skills.go）。
+	skillSeeds := skillsSeedTurns(req.Skills, r.cfg.Facade.PromptByteLimit())
+
 	// 历史一条放不下（全量折叠时被裁过）：先分段把历史补种进新会话，再发本轮 ——
 	// 换号、网关重启、旧会话作废之后，上游照样拿到客户端手里的完整历史。
 	if historyTrimmed(full) {
@@ -476,12 +479,18 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 			if !req.Bridge && r.cfg.Facade.PlatformNotice {
 				notice = platformNotice
 			}
-			plan.seeds, plan.fallback = seeds, full
+			plan.seeds, plan.fallback = append(skillSeeds, seeds...), full
 			items := nt.currentWithSystem(notice)
 			r.log.Info("原生续接：新建上游会话，历史分段补种后发送本轮", "key", nt.key, "cid", cid,
-				"parts", len(seeds), "bytes", promptBytes(items))
+				"skillParts", len(skillSeeds), "parts", len(seeds), "bytes", promptBytes(items))
 			return items
 		}
+	}
+	if len(skillSeeds) > 0 {
+		plan.seeds, plan.fallback = skillSeeds, full
+		r.log.Info("原生续接：新建上游会话，补种技能清单后发送全量", "key", nt.key, "cid", cid,
+			"skillParts", len(skillSeeds), "bytes", promptBytes(full))
+		return full
 	}
 	r.log.Info("原生续接：新建上游会话，首轮发送全量", "key", nt.key, "cid", cid, "bytes", promptBytes(full))
 	return full
