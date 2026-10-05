@@ -627,6 +627,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	var (
 		prev      string
 		firstAt   time.Time
+		rate      outputRate // 出字速度（见 outrate.go）
 		requestID = startResp.RequestID
 		convID    = startResp.ConversationID
 		turnState = startResp.TurnState
@@ -863,6 +864,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				result.Text = prev + st.Delta
 			}
 			prev = result.Text
+			rate.observe(result.Text, req.Bridge)
 			// 有进展就把退避重置回基线。
 			interval = f.PollInterval
 		} else {
@@ -904,6 +906,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				return result, err
 			}
 			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
+			if emit != nil { // 补种等内部轮次不记
+				rate.log(r.log, req.Model, acct.ID, result.Text, started)
+			}
 			// 用量计算与上方 start 直达完成路径同款。
 			if result.Usage == nil {
 				result.Usage = measuredUsage(inputTokens(), result)
