@@ -26,6 +26,9 @@ var ErrClientGone = errors.New("客户端已断开")
 
 // RunRequest 是一次推理请求的中间表示（与具体对外 API 形态无关）。
 type RunRequest struct {
+	// Seed 标记补种轮（见 native.go seedConversation）：只为把内容送进上游会话，不记出字速度。
+	Seed bool
+
 	// Input 是上游要的 input 数组。
 	//
 	// 由各 API 适配层把 messages / input 翻译成这种条目形态：
@@ -721,6 +724,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		}
 		if st.Done {
 			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
+			if !req.Seed { // 发起即答完：没有出字过程可量，只记总量与耗时
+				rate.log(r.log, req.Model, acct.ID, result.Text, started)
+			}
 			// 上游轮询响应从不回 usage（顶层与 payload 均无此键，抓包实证），
 			// 按本轮实际收发内容精确计数（见 usage.go）。
 			if result.Usage == nil {
@@ -906,7 +912,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				return result, err
 			}
 			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
-			if emit != nil { // 补种等内部轮次不记
+			if !req.Seed {
 				rate.log(r.log, req.Model, acct.ID, result.Text, started)
 			}
 			// 用量计算与上方 start 直达完成路径同款。

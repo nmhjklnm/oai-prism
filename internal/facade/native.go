@@ -584,7 +584,7 @@ func (r *Runner) seedConversation(ctx context.Context, acct *account.Account, re
 	plan := req.Native.plan
 	for i, seed := range plan.seeds {
 		sreq := &RunRequest{
-			Input: seed, Model: req.Model, Effort: req.Effort, UserID: req.UserID,
+			Seed: true, Input: seed, Model: req.Model, Effort: req.Effort, UserID: req.UserID,
 			ConversationID: plan.cid, ProjectID: projectID, StickyKey: req.StickyKey,
 			API: req.API, Bridge: true, ExtraHeaders: req.ExtraHeaders, Deadline: req.Deadline,
 		}
