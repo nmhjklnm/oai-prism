@@ -2,6 +2,7 @@ package facade
 
 import (
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 // 1~3 秒轮询一次拿累计正文，所以这是近似值：太短的回答（只到一两段）不算速度；
 // 思考阶段的 token 上游不给，也不在内。
 //
-// 桥模式另记 block_tail：```codex-exec 块写完到上游宣布本轮结束隔了多久 —— 网关现在
+// 桥模式另记 block_tail_s：```codex-exec 块写完到上游宣布本轮结束隔了多久 —— 网关现在
 // 要等整轮结束才取块（见 responses.go），这个数决定"块一写完就派发"值不值得做。
 
 // outputRate 记录一轮里正文到达的时间线。
@@ -47,22 +48,25 @@ func execBlockClosed(text string) bool {
 	return i >= 0 && strings.Contains(text[i+len("```codex-exec"):], "```")
 }
 
-// log 在一轮成功结束时写一行"出字速度"。first_text 是发起到第一段正文（含排队、思考）。
+// log 在一轮成功结束时写一行"出字速度"。first_text_s 是发起到第一段正文（含排队、思考）。
 func (o *outputRate) log(l *slog.Logger, model, account, text string, started time.Time) {
 	now := time.Now()
 	total := tokens.Count(text)
 	attrs := []any{"model", model, "account", account, "out_tokens", total, "deltas", o.deltas,
-		"total", now.Sub(started).Round(time.Millisecond)}
+		"total_s", secs(now.Sub(started))}
 	if o.deltas > 0 {
-		attrs = append(attrs, "first_text", o.firstAt.Sub(started).Round(time.Millisecond))
+		attrs = append(attrs, "first_text_s", secs(o.firstAt.Sub(started)))
 	}
 	if span := o.lastAt.Sub(o.firstAt); o.deltas >= 2 && span >= time.Second {
 		gen := total - o.firstTok
-		attrs = append(attrs, "gen_tokens", gen, "gen_span", span.Round(time.Millisecond),
-			"tok_per_sec", float64(int(float64(gen)/span.Seconds()*10))/10)
+		attrs = append(attrs, "gen_tokens", gen, "gen_span_s", secs(span),
+			"tok_per_sec", math.Round(float64(gen)/span.Seconds()*10)/10)
 	}
 	if !o.blockAt.IsZero() {
-		attrs = append(attrs, "block_tail", now.Sub(o.blockAt).Round(time.Millisecond))
+		attrs = append(attrs, "block_tail_s", secs(now.Sub(o.blockAt)))
 	}
 	l.Info("出字速度", attrs...)
 }
+
+// secs 把时长写成保留两位小数的秒数（JSON 日志里 time.Duration 是纳秒整数，不好读也不好算）。
+func secs(d time.Duration) float64 { return math.Round(d.Seconds()*100) / 100 }
